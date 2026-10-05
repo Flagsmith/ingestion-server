@@ -1,0 +1,78 @@
+{
+    "family": "events-ingestion-api",
+    "networkMode": "awsvpc",
+    "executionRoleArn": "arn:aws:iam::084060095745:role/events-ingestion-task-exec-role",
+    "taskRoleArn": "arn:aws:iam::084060095745:role/events-ingestion-task-role",
+    "requiresCompatibilities": [
+        "FARGATE"
+    ],
+    "runtimePlatform": {
+        "operatingSystemFamily": "LINUX",
+        "cpuArchitecture": "ARM64"
+    },
+    "cpu": "1024",
+    "memory": "2048",
+    "containerDefinitions": [
+        {
+            "name": "events-ingestion-api",
+            "image": "084060095745.dkr.ecr.eu-west-2.amazonaws.com/experimentation/events-ingestion-api:v0.1.2",
+            "cpu": 0,
+            "portMappings": [
+                {
+                    "containerPort": 8080,
+                    "hostPort": 8080,
+                    "protocol": "tcp"
+                }
+            ],
+            "essential": true,
+            "environment": [
+                {
+                    "name": "AWS_REGION",
+                    "value": "eu-west-2"
+                },
+                {
+                    "name": "AWS_DEFAULT_REGION",
+                    "value": "eu-west-2"
+                },
+                {
+                    "name": "ENVIRONMENT",
+                    "value": "production"
+                },
+                {
+                    "name": "KAFKA_BOOTSTRAP_SERVERS",
+                    "value": "boot-1e3.eventsingestionkafka.usdlws.c4.kafka.eu-west-2.amazonaws.com:9096,boot-5gt.eventsingestionkafka.usdlws.c4.kafka.eu-west-2.amazonaws.com:9096,boot-q1c.eventsingestionkafka.usdlws.c4.kafka.eu-west-2.amazonaws.com:9096"
+                },
+                {
+                    "name": "KAFKA_TOPIC",
+                    "value": "flagsmith_warehouse_events"
+                },
+                {
+                    "name": "KAFKA_EXTERNAL_TOPIC",
+                    "value": "external_warehouse_events"
+                }
+            ],
+            "secrets": [
+                {
+                    "name": "KAFKA_USERNAME",
+                    "valueFrom": "arn:aws:secretsmanager:eu-west-2:084060095745:secret:AmazonMSK_events-ingestion-api-1m0riQ:username::"
+                },
+                {
+                    "name": "KAFKA_PASSWORD",
+                    "valueFrom": "arn:aws:secretsmanager:eu-west-2:084060095745:secret:AmazonMSK_events-ingestion-api-1m0riQ:password::"
+                },
+                {
+                    "name": "DATABASE_URL",
+                    "valueFrom": "arn:aws:secretsmanager:eu-west-2:084060095745:secret:INGESTION-SERVER-HoNwv2:DATABASE_URL::"
+                }
+            ],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "/ecs/events-ingestion-api",
+                    "awslogs-region": "eu-west-2",
+                    "awslogs-stream-prefix": "awslogs-events-ingestion"
+                }
+            }
+        }
+    ]
+}

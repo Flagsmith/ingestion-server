@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust lint & test
+    runs-on: depot-ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://postgres:password@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all
+
+  docker:
+    name: Docker build & smoke
+    runs-on: depot-ubuntu-24.04-arm
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Depot CLI
+        uses: depot/setup-action@v1
+
+      - name: Build image (linux/arm64, load locally)
+        uses: depot/build-push-action@v1
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: flagsmith-analytics:ci
+
+      - name: Run container
+        run: |
+          docker run -d --name hw -p 8080:8080 --platform linux/arm64 \
+            -e KAFKA_BOOTSTRAP_SERVERS=localhost:9092 \
+            -e KAFKA_TOPIC=ci-smoke \
+            -e KAFKA_EXTERNAL_TOPIC=ci-smoke-external \
+            -e KAFKA_AUTH=none \
+            -e DATABASE_URL=postgres://postgres:password@localhost:5432/postgres \
+            flagsmith-analytics:ci
+          for i in {1..20}; do
+            if curl -fsS http://localhost:8080/health >/dev/null; then
+              echo "container is up"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Smoke test endpoints
+        run: |
+          curl -fsS http://localhost:8080/health | tee /dev/stderr | grep -q "healthy"
+
+      - name: Container logs (on failure)
+        if: failure()
+        run: docker logs hw || true
+
+      - name: Tear down
+        if: always()
+        run: docker rm -f hw || true
