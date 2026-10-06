@@ -6,8 +6,8 @@
 FROM rust:1-slim AS builder
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends cmake make perl pkg-config g++ libcurl4-openssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+  && apt-get install -y --no-install-recommends cmake make perl pkg-config g++ libcurl4-openssl-dev \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -26,12 +26,15 @@ FROM debian:trixie-slim
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/target/release/flagsmith-analytics /usr/local/bin/flagsmith-analytics
 
 ENV LISTEN_ADDR=0.0.0.0:8080
 EXPOSE 8080
+
+RUN useradd --system --uid 10001 --no-create-home app
+USER 10001:10001
 
 ENTRYPOINT ["/usr/local/bin/flagsmith-analytics"]
