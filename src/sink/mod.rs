@@ -1,7 +1,11 @@
+mod batching;
+mod clickhouse;
 mod kafka;
 
 use std::time::Duration;
 
+pub use batching::{BatchConfig, BatchingSink};
+pub use clickhouse::{ClickHouseSinkConfig, ClickHouseWriter};
 pub use kafka::{KafkaAuth, KafkaSink, KafkaSinkConfig};
 
 use crate::models::EventRecord;
@@ -10,6 +14,7 @@ use crate::models::EventRecord;
 #[derive(Clone)]
 pub enum Sink {
     Kafka(KafkaSink),
+    ClickHouse(BatchingSink<ClickHouseWriter>),
 }
 
 impl Sink {
@@ -22,6 +27,8 @@ impl Sink {
     ) -> Result<(), SinkError> {
         match self {
             Self::Kafka(sink) => Ok(sink.put(destination, records).await?),
+            // A single table: there is no per-environment destination.
+            Self::ClickHouse(sink) => sink.put(records),
         }
     }
 
@@ -29,6 +36,7 @@ impl Sink {
     pub fn fatal_error(&self) -> Option<String> {
         match self {
             Self::Kafka(sink) => sink.fatal_error(),
+            Self::ClickHouse(_) => None,
         }
     }
 
@@ -36,6 +44,7 @@ impl Sink {
     pub async fn shutdown(self, timeout: Duration) {
         match self {
             Self::Kafka(sink) => sink.shutdown(timeout).await,
+            Self::ClickHouse(sink) => sink.shutdown(timeout).await,
         }
     }
 }
@@ -44,4 +53,8 @@ impl Sink {
 pub enum SinkError {
     #[error(transparent)]
     Kafka(#[from] kafka::DeliveryError),
+    #[error("ClickHouse insert failed: {0}")]
+    ClickHouse(#[from] ::clickhouse::error::Error),
+    #[error("Sink buffer is full")]
+    BufferFull,
 }

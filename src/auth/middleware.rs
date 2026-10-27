@@ -22,7 +22,8 @@ pub struct EnvironmentContext {
 #[derive(Clone)]
 pub struct ContextState {
     pub environment_keys: EnvironmentKeys,
-    pub external_topic: Arc<str>,
+    /// Kafka only; other sinks write every environment to one place.
+    pub external_topic: Option<Arc<str>>,
 }
 
 pub async fn extract_environment_context(
@@ -60,7 +61,8 @@ pub async fn extract_environment_context(
 
     let destination = environment_key
         .uses_external_warehouse
-        .then(|| state.external_topic.clone());
+        .then(|| state.external_topic.clone())
+        .flatten();
 
     request.extensions_mut().insert(EnvironmentContext {
         client_api_key: environment_key.client_api_key,
@@ -87,7 +89,7 @@ mod tests {
     fn test_state(pool: PgPool) -> ContextState {
         ContextState {
             environment_keys: EnvironmentKeys::new(pool, Duration::from_secs(300)),
-            external_topic: Arc::from("external-topic"),
+            external_topic: Some(Arc::from("external-topic")),
         }
     }
 

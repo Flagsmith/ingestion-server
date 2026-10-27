@@ -18,7 +18,7 @@ use tracing::info;
 use auth::ContextState;
 use config::{Config, SinkConfig};
 use environment_keys::EnvironmentKeys;
-use sink::{KafkaSink, KafkaSinkConfig, Sink};
+use sink::{BatchingSink, ClickHouseWriter, KafkaSink, KafkaSinkConfig, Sink};
 
 const ENVIRONMENT_KEY_REFRESH_AFTER: Duration = Duration::from_secs(300);
 
@@ -47,7 +47,20 @@ async fn main() -> anyhow::Result<()> {
                 kafka.topic.clone(),
                 kafka.auth.clone(),
             ))?;
-            (Sink::Kafka(sink), kafka.external_topic.as_str())
+            (Sink::Kafka(sink), Some(kafka.external_topic.as_str()))
+        }
+        SinkConfig::ClickHouse { clickhouse, batch } => {
+            info!(
+                listen_addr = %config.listen_addr,
+                clickhouse = ?clickhouse,
+                batch = ?batch,
+                "Starting flagsmith-analytics server"
+            );
+            let writer = ClickHouseWriter::new(clickhouse.clone());
+            (
+                Sink::ClickHouse(BatchingSink::new(writer, batch.clone())),
+                None,
+            )
         }
     };
 
@@ -57,7 +70,7 @@ async fn main() -> anyhow::Result<()> {
         .connect_lazy(&config.database_url)?;
     let context_state = ContextState {
         environment_keys: EnvironmentKeys::new(pool, ENVIRONMENT_KEY_REFRESH_AFTER),
-        external_topic: Arc::from(external_topic),
+        external_topic: external_topic.map(Arc::from),
     };
 
     let app = routes::app(sink.clone(), context_state);

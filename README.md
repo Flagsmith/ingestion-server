@@ -52,17 +52,25 @@ On the wire to Kafka, `traits` and `metadata` are produced as JSON-encoded strin
 
 | Env var | Required | Default |
 |---|---|---|
-| `SINK` | no | `kafka` (the only sink so far) |
-| `KAFKA_BOOTSTRAP_SERVERS` | yes | — |
-| `KAFKA_TOPIC` | yes | — |
-| `KAFKA_EXTERNAL_TOPIC` | yes | — |
+| `SINK` | no | `kafka` (or `clickhouse`) |
+| `KAFKA_BOOTSTRAP_SERVERS` | with `kafka` | — |
+| `KAFKA_TOPIC` | with `kafka` | — |
+| `KAFKA_EXTERNAL_TOPIC` | with `kafka` | — |
 | `KAFKA_AUTH` | no | `scram` (`none` for plaintext local brokers) |
 | `KAFKA_USERNAME` | with `scram` | — |
 | `KAFKA_PASSWORD` | with `scram` | — |
+| `CLICKHOUSE_URL` | with `clickhouse` | — |
+| `CLICKHOUSE_USER` | no | `default` |
+| `CLICKHOUSE_PASSWORD` | no | empty |
+| `CLICKHOUSE_DATABASE` | no | `flagsmith_exp` |
+| `CLICKHOUSE_TABLE` | no | `events` |
+| `SINK_FLUSH_INTERVAL_MS` | no | `1000` |
+| `SINK_BATCH_MAX_ROWS` | no | `50000` |
+| `SINK_BUFFER_MAX_BYTES` | no | `67108864` (64 MiB) |
 | `DATABASE_URL` | yes | — |
 | `LISTEN_ADDR` | no | `0.0.0.0:8080` |
 
-Events from environments that use an external warehouse go to `KAFKA_EXTERNAL_TOPIC`; all others go to `KAFKA_TOPIC`. The server looks presented keys up in the `experimentation_environment_keys` view in Flagsmith's Postgres, at `DATABASE_URL`.
+With `SINK=kafka`, events from environments that use an external warehouse go to `KAFKA_EXTERNAL_TOPIC`; all others go to `KAFKA_TOPIC`. With `SINK=clickhouse`, every event goes to the one ClickHouse table. The server looks presented keys up in the `experimentation_environment_keys` view in Flagsmith's Postgres, at `DATABASE_URL`.
 
 ### Database role
 
@@ -78,6 +86,10 @@ GRANT SELECT ON experimentation_environment_keys TO ingestion_server;
 The view reads its tables with its owner's privileges, so the role needs no access to them. If Flagsmith adds an `experimentation_environment_keys_v2` view, grant `SELECT` on it before deploying a server that reads it.
 
 With `KAFKA_AUTH=scram`, the producer authenticates with SASL/SCRAM-SHA-512 over TLS; MSK serves it on port 9096. The task definition injects both credentials from the `AmazonMSK_*` secret in Secrets Manager.
+
+### ClickHouse sink
+
+With `SINK=clickhouse`, `202` means the events are buffered in memory, not yet stored. A background task writes the buffer every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_BATCH_MAX_ROWS` rows are waiting, as one `INSERT` per batch. A failed batch is retried 3 times and then dropped with an error log. Once the buffer reaches `SINK_BUFFER_MAX_BYTES`, requests get `503` until a flush frees space. A normal shutdown (SIGTERM) flushes the buffer, but events still buffered are lost if the process crashes.
 
 ## Run locally
 

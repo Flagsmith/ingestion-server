@@ -53,7 +53,7 @@ mod tests {
     fn context_state(pool: PgPool) -> ContextState {
         ContextState {
             environment_keys: EnvironmentKeys::new(pool, Duration::from_secs(300)),
-            external_topic: Arc::from(EXTERNAL_WAREHOUSE_TOPIC),
+            external_topic: Some(Arc::from(EXTERNAL_WAREHOUSE_TOPIC)),
         }
     }
 
