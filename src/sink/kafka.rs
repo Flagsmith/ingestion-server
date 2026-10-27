@@ -149,7 +149,7 @@ impl KafkaSink {
         &self,
         destination: Option<&str>,
         records: &[EventRecord<'_>],
-    ) -> Result<(), SinkError> {
+    ) -> Result<(), DeliveryError> {
         let topic = destination.unwrap_or(&self.default_topic);
         let total = records.len();
         let payloads: Vec<Vec<u8>> = records
@@ -167,7 +167,7 @@ impl KafkaSink {
         let mut failures = join_all(sends).await.into_iter().filter_map(Result::err);
         match failures.next() {
             None => Ok(()),
-            Some((error, _record)) => Err(SinkError::Delivery {
+            Some((error, _record)) => Err(DeliveryError {
                 failed: 1 + failures.count(),
                 total,
                 error,
@@ -198,13 +198,11 @@ impl KafkaSink {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum SinkError {
-    #[error("Kafka delivery failed for {failed} of {total} records: {error}")]
-    Delivery {
-        failed: usize,
-        total: usize,
-        error: KafkaError,
-    },
+#[error("Kafka delivery failed for {failed} of {total} records: {error}")]
+pub struct DeliveryError {
+    failed: usize,
+    total: usize,
+    error: KafkaError,
 }
 
 #[cfg(test)]

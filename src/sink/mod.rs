@@ -19,9 +19,9 @@ impl Sink {
         &self,
         destination: Option<&str>,
         records: &[EventRecord<'_>],
-    ) -> Result<(), kafka::SinkError> {
+    ) -> Result<(), SinkError> {
         match self {
-            Self::Kafka(sink) => sink.put(destination, records).await,
+            Self::Kafka(sink) => Ok(sink.put(destination, records).await?),
         }
     }
 
@@ -38,4 +38,10 @@ impl Sink {
             Self::Kafka(sink) => sink.shutdown(timeout).await,
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SinkError {
+    #[error(transparent)]
+    Kafka(#[from] kafka::DeliveryError),
 }
