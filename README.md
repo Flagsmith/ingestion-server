@@ -102,7 +102,7 @@ curl localhost:8080/health
 
 The Kafka producer and Postgres pool connect lazily, so `/health` responds even without either available.
 
-`cargo test` needs a Postgres it can create databases in, at `DATABASE_URL`: each database test gets a fresh one.
+`cargo test` needs a Postgres it can create databases in, at `DATABASE_URL`, and a ClickHouse it can create databases in, at `CLICKHOUSE_URL` (with `CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD` if needed): each database test gets a fresh one.
 
 ## CI / CD
 

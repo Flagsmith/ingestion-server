@@ -37,6 +37,7 @@ impl fmt::Debug for ClickHouseSinkConfig {
 /// column is non-Nullable, so absent optionals are written as "", as
 /// ClickPipes does.
 #[derive(Debug, PartialEq, Row, Serialize)]
+#[cfg_attr(test, derive(serde::Deserialize))]
 pub struct ClickHouseRow {
     environment_key: String,
     event: String,
@@ -135,6 +136,8 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::sink::{BatchConfig, BatchingSink};
+    use crate::test_helpers::{now_ms, ClickHouseTestDatabase};
 
     #[test]
     fn row_fills_every_column_and_blanks_absent_optionals() {
@@ -193,5 +196,102 @@ mod tests {
         let shown = format!("{config:?}");
         assert!(shown.contains("ingest"));
         assert!(!shown.contains("hunter2"));
+    }
+
+    fn batch_config(flush_interval: Duration) -> BatchConfig {
+        BatchConfig {
+            flush_interval,
+            max_rows: 1000,
+            max_bytes: 1024 * 1024,
+        }
+    }
+
+    #[tokio::test]
+    async fn flushed_rows_land_in_the_events_table() {
+        let db = ClickHouseTestDatabase::create().await;
+        let sink = BatchingSink::new(
+            ClickHouseWriter::new(db.config.clone()),
+            batch_config(Duration::from_millis(100)),
+        );
+        let ts = now_ms();
+        let control = json!("control");
+        let null = json!(null);
+        let traits = json!({"plan": "pro"});
+        let metadata = json!({"source": "csv"});
+        let records = [
+            EventRecord {
+                environment_key: "env",
+                collected_at: ts + 1,
+                sdk_language: "python",
+                sdk_version: "1.0.0",
+                event: "$flag_exposure",
+                feature_name: Some("dark_mode"),
+                identifier: Some("user_1"),
+                value: &control,
+                traits: Some(&traits),
+                metadata: Some(&metadata),
+                timestamp: ts,
+            },
+            EventRecord {
+                environment_key: "env",
+                collected_at: ts + 1,
+                sdk_language: "python",
+                sdk_version: "1.0.0",
+                event: "purchase",
+                feature_name: None,
+                identifier: None,
+                value: &null,
+                traits: None,
+                metadata: None,
+                timestamp: ts + 2,
+            },
+        ];
+
+        sink.put(&records).unwrap();
+        db.wait_for_rows(2).await;
+
+        let stored: Vec<ClickHouseRow> = db
+            .client
+            .query("SELECT ?fields FROM events ORDER BY timestamp")
+            .fetch_all()
+            .await
+            .unwrap();
+        let expected: Vec<ClickHouseRow> = records.iter().map(ClickHouseWriter::row).collect();
+        assert_eq!(stored, expected);
+        assert_eq!(stored[0].value, "control");
+        assert_eq!(stored[1].value, "");
+
+        sink.shutdown(Duration::from_secs(5)).await;
+        db.drop().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_writes_buffered_rows() {
+        let db = ClickHouseTestDatabase::create().await;
+        let sink = BatchingSink::new(
+            ClickHouseWriter::new(db.config.clone()),
+            batch_config(Duration::from_secs(3600)),
+        );
+        let value = json!(42);
+        let record = EventRecord {
+            environment_key: "env",
+            collected_at: now_ms(),
+            sdk_language: "rust",
+            sdk_version: "1.0.0",
+            event: "purchase",
+            feature_name: None,
+            identifier: None,
+            value: &value,
+            traits: None,
+            metadata: None,
+            timestamp: now_ms(),
+        };
+
+        sink.put(&[record.clone(), record.clone(), record]).unwrap();
+        assert_eq!(db.count().await, 0);
+        sink.shutdown(Duration::from_secs(5)).await;
+
+        assert_eq!(db.count().await, 3);
+        db.drop().await;
     }
 }
