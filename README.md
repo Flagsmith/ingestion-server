@@ -42,7 +42,7 @@ An empty `events` array adds a top-level `error` field: `{ "accepted": 0, "rejec
 }
 ```
 
-`event` and `timestamp` (epoch millis) are required. `$flag_exposure` is a reserved system event and requires `feature_name` (omitting it rejects that event); `identifier`, `value`, `traits`, and `metadata` are optional.
+`event` and `timestamp` (epoch millis) are required; `timestamp` must be after 2020-01-01, no more than 24h in the future and no more than 10 days in the past (otherwise that event is rejected). `$flag_exposure` is a reserved system event and requires `feature_name` (omitting it rejects that event); `identifier`, `value`, `traits`, and `metadata` are optional.
 
 Field limits — an over-limit field rejects that event: `event` ≤ 256 chars; `feature_name` and `identifier` ≤ 2000 chars, trait keys ≤ 200 chars, trait string values ≤ 2000 chars (all matching Flagsmith's model limits); serialized `value` ≤ 128 KiB (fits Flagsmith's default 20,000-char flag value limit), `traits` ≤ 32 KiB, `metadata` ≤ 8 KiB. `traits` must be a JSON object.
 

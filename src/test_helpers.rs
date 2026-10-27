@@ -14,6 +14,11 @@ pub(crate) const FLAGSMITH_WAREHOUSE_TOPIC: &str = "events-default";
 
 pub(crate) type MockKafkaCluster = MockCluster<'static, DefaultProducerContext>;
 
+/// Event timestamps must be recent to pass validation.
+pub(crate) fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
 /// The cluster is torn down on drop, so it must outlive every request in the
 /// test.
 pub(crate) struct MockKafka {

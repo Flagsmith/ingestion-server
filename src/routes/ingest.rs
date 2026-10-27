@@ -39,8 +39,13 @@ fn parse_sdk_user_agent(header: &str) -> (String, String) {
 
 /// 2020-01-01T00:00:00Z in epoch-millis; mirrors ClickHouse's `timestamp_sane` constraint.
 const MIN_TIMESTAMP_MS: i64 = 1_577_836_800_000;
-/// Future clock-skew allowance.
-const MAX_FUTURE_SKEW_MS: i64 = 24 * 60 * 60 * 1000;
+const HOUR_MS: i64 = 60 * 60 * 1000;
+const DAY_MS: i64 = 24 * HOUR_MS;
+/// Future clock-skew allowance, in hours after now.
+const MAX_FUTURE_SKEW_HOURS: i64 = 24;
+/// Oldest accepted event, in days before now. Bounds how many daily
+/// ClickHouse partitions one insert can touch.
+const MAX_EVENT_AGE_DAYS: i64 = 10;
 
 /// Event names live in our own namespace and a LowCardinality ClickHouse column.
 const MAX_EVENT_NAME_CHARS: usize = 256;
@@ -72,9 +77,26 @@ fn json_size(value: &serde_json::Value) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+fn validate_event_timestamps(timestamp: i64, now: i64) -> Result<(), String> {
+    if timestamp <= MIN_TIMESTAMP_MS {
+        return Err("timestamp must be an epoch-millis value after 2020-01-01".to_string());
+    }
+    if timestamp > now + MAX_FUTURE_SKEW_HOURS * HOUR_MS {
+        return Err(format!(
+            "timestamp must not be more than {MAX_FUTURE_SKEW_HOURS}h in the future"
+        ));
+    }
+    if timestamp < now - MAX_EVENT_AGE_DAYS * DAY_MS {
+        return Err(format!(
+            "timestamp must not be more than {MAX_EVENT_AGE_DAYS} days in the past"
+        ));
+    }
+    Ok(())
+}
+
 /// Validates one event against the ingest schema rules. Error messages name
 /// the offending field; the caller prefixes the batch index.
-fn validate_event(event: &Event, max_timestamp: i64) -> Result<(), String> {
+fn validate_event(event: &Event, now: i64) -> Result<(), String> {
     if event.event.trim().is_empty() {
         return Err("event must be non-empty".to_string());
     }
@@ -110,12 +132,7 @@ fn validate_event(event: &Event, max_timestamp: i64) -> Result<(), String> {
             ));
         }
     }
-    if event.timestamp <= MIN_TIMESTAMP_MS {
-        return Err("timestamp must be an epoch-millis value after 2020-01-01".to_string());
-    }
-    if event.timestamp > max_timestamp {
-        return Err("timestamp must not be more than 24h in the future".to_string());
-    }
+    validate_event_timestamps(event.timestamp, now)?;
     if json_size(&event.value) > MAX_VALUE_BYTES {
         return Err(format!(
             "value must serialize to at most {MAX_VALUE_BYTES} bytes"
@@ -161,11 +178,11 @@ fn validate_event(event: &Event, max_timestamp: i64) -> Result<(), String> {
 /// event is validated independently: one invalid event never blocks its
 /// neighbours.
 fn partition_events(events: &[Event]) -> (Vec<&Event>, Vec<RejectedEvent>) {
-    let max_timestamp = Utc::now().timestamp_millis() + MAX_FUTURE_SKEW_MS;
+    let now = Utc::now().timestamp_millis();
     let mut valid = Vec::with_capacity(events.len());
     let mut rejected = Vec::new();
     for (i, event) in events.iter().enumerate() {
-        match validate_event(event, max_timestamp) {
+        match validate_event(event, now) {
             Ok(()) => valid.push(event),
             Err(error) => rejected.push(RejectedEvent {
                 index: i,
@@ -288,7 +305,7 @@ mod tests {
 
     use crate::sink::{KafkaAuth, KafkaSink, KafkaSinkConfig};
     use crate::test_helpers::{
-        assert_topic_empty, mock_kafka, read_records, FLAGSMITH_WAREHOUSE_TOPIC,
+        assert_topic_empty, mock_kafka, now_ms, read_records, FLAGSMITH_WAREHOUSE_TOPIC,
     };
 
     fn parse(json: &str) -> EventBatch {
@@ -348,9 +365,10 @@ mod tests {
 
     #[test]
     fn test_validate_accepts_exposure_with_feature_name() {
-        assert!(accepts(
-            r#"{"events":[{"event":"$flag_exposure","feature_name":"dark_mode","value":"control","timestamp":1700000000000}]}"#,
-        ));
+        let ts = now_ms();
+        assert!(accepts(&format!(
+            r#"{{"events":[{{"event":"$flag_exposure","feature_name":"dark_mode","value":"control","timestamp":{ts}}}]}}"#,
+        )));
     }
 
     #[test]
@@ -422,10 +440,31 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_accepts_custom_event() {
-        assert!(accepts(
-            r#"{"events":[{"event":"purchase","value":42,"timestamp":1700000000000}]}"#
+    fn test_validate_accepts_timestamp_within_max_age() {
+        let ts = now_ms() - 10 * DAY_MS + 60_000;
+        assert!(accepts(&format!(
+            r#"{{"events":[{{"event":"purchase","timestamp":{ts}}}]}}"#
+        )));
+    }
+
+    #[test]
+    fn test_validate_rejects_timestamp_older_than_max_age() {
+        let ts = now_ms() - 11 * DAY_MS;
+        let (_, rejected) = partition(&format!(
+            r#"{{"events":[{{"event":"purchase","timestamp":{ts}}}]}}"#
         ));
+        assert_eq!(
+            rejected[0].error,
+            "events[0].timestamp must not be more than 10 days in the past"
+        );
+    }
+
+    #[test]
+    fn test_validate_accepts_custom_event() {
+        let ts = now_ms();
+        assert!(accepts(&format!(
+            r#"{{"events":[{{"event":"purchase","value":42,"timestamp":{ts}}}]}}"#
+        )));
     }
 
     #[test]
@@ -433,13 +472,14 @@ mod tests {
         // One invalid event never blocks its neighbours; the rejection names
         // the offending index and carries the same message the old whole-batch
         // 400 used.
-        let (accepted, rejected) = partition(
-            r#"{"events":[
-                {"event":"purchase","value":42,"timestamp":1700000000000},
-                {"event":"purchase","timestamp":1},
-                {"event":"$flag_exposure","feature_name":"dark_mode","timestamp":1700000000000}
-            ]}"#,
-        );
+        let ts = now_ms();
+        let (accepted, rejected) = partition(&format!(
+            r#"{{"events":[
+                {{"event":"purchase","value":42,"timestamp":{ts}}},
+                {{"event":"purchase","timestamp":1}},
+                {{"event":"$flag_exposure","feature_name":"dark_mode","timestamp":{ts}}}
+            ]}}"#,
+        ));
         assert_eq!(accepted, 2);
         assert_eq!(rejected.len(), 1);
         assert_eq!(rejected[0].index, 1);
@@ -557,6 +597,11 @@ mod tests {
         app_with_destination(sink, None)
     }
 
+    fn purchase_json() -> String {
+        let ts = now_ms();
+        format!(r#"{{"events":[{{"event":"purchase","value":42,"timestamp":{ts}}}]}}"#)
+    }
+
     fn post_events(json: &str) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -574,14 +619,15 @@ mod tests {
     #[tokio::test]
     async fn test_handler_mixed_batch_returns_202_and_forwards_valid_only() {
         let kafka = mock_kafka(&[FLAGSMITH_WAREHOUSE_TOPIC]);
+        let ts = now_ms();
         let response = app(&kafka.sink)
-            .oneshot(post_events(
-                r#"{"events":[
-                    {"event":"purchase","value":42,"timestamp":1700000000000},
-                    {"event":"purchase","timestamp":1},
-                    {"event":"$flag_exposure","feature_name":"dark_mode","timestamp":1700000000000}
-                ]}"#,
-            ))
+            .oneshot(post_events(&format!(
+                r#"{{"events":[
+                    {{"event":"purchase","value":42,"timestamp":{ts}}},
+                    {{"event":"purchase","timestamp":1}},
+                    {{"event":"$flag_exposure","feature_name":"dark_mode","timestamp":{ts}}}
+                ]}}"#,
+            )))
             .await
             .unwrap();
 
@@ -601,10 +647,11 @@ mod tests {
         // The destination String columns (and the ClickPipes field mapping)
         // take flat scalar fields, so dict fields go on the wire JSON-encoded.
         let kafka = mock_kafka(&[FLAGSMITH_WAREHOUSE_TOPIC]);
+        let ts = now_ms();
         let response = app(&kafka.sink)
-            .oneshot(post_events(
-                r#"{"events":[{"event":"purchase","traits":{"logins":42,"plan":"pro"},"metadata":{"source":"csv"},"timestamp":1700000000000}]}"#,
-            ))
+            .oneshot(post_events(&format!(
+                r#"{{"events":[{{"event":"purchase","traits":{{"logins":42,"plan":"pro"}},"metadata":{{"source":"csv"}},"timestamp":{ts}}}]}}"#,
+            )))
             .await
             .unwrap();
 
@@ -659,9 +706,7 @@ mod tests {
         let sink = unreachable_sink();
         let started = std::time::Instant::now();
         let response = app(&sink)
-            .oneshot(post_events(
-                r#"{"events":[{"event":"purchase","value":42,"timestamp":1700000000000}]}"#,
-            ))
+            .oneshot(post_events(&purchase_json()))
             .await
             .unwrap();
 
@@ -688,9 +733,7 @@ mod tests {
             .expect("topic error");
         let started = std::time::Instant::now();
         let response = app(&kafka.sink)
-            .oneshot(post_events(
-                r#"{"events":[{"event":"purchase","value":42,"timestamp":1700000000000}]}"#,
-            ))
+            .oneshot(post_events(&purchase_json()))
             .await
             .unwrap();
 
@@ -707,9 +750,7 @@ mod tests {
     async fn test_handler_forwards_to_configured_destination() {
         let kafka = mock_kafka(&[FLAGSMITH_WAREHOUSE_TOPIC, "events-dest-x"]);
         let response = app_with_destination(&kafka.sink, Some("events-dest-x"))
-            .oneshot(post_events(
-                r#"{"events":[{"event":"purchase","value":42,"timestamp":1700000000000}]}"#,
-            ))
+            .oneshot(post_events(&purchase_json()))
             .await
             .unwrap();
 
@@ -722,8 +763,9 @@ mod tests {
     #[tokio::test]
     async fn test_handler_delivers_large_batches() {
         let kafka = mock_kafka(&[FLAGSMITH_WAREHOUSE_TOPIC]);
+        let ts = now_ms();
         let events: Vec<String> = (0..501)
-            .map(|i| format!(r#"{{"event":"purchase","value":{i},"timestamp":1700000000000}}"#))
+            .map(|i| format!(r#"{{"event":"purchase","value":{i},"timestamp":{ts}}}"#))
             .collect();
         let body = format!(r#"{{"events":[{}]}}"#, events.join(","));
         let response = app(&kafka.sink).oneshot(post_events(&body)).await.unwrap();
@@ -737,7 +779,8 @@ mod tests {
     }
 
     fn event_json(fields: &str) -> String {
-        format!(r#"{{"events":[{{{fields},"timestamp":1700000000000}}]}}"#)
+        let ts = now_ms();
+        format!(r#"{{"events":[{{{fields},"timestamp":{ts}}}]}}"#)
     }
 
     #[test]
