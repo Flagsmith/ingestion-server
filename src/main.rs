@@ -16,9 +16,9 @@ use tokio::signal;
 use tracing::info;
 
 use auth::ContextState;
-use config::Config;
+use config::{Config, SinkConfig};
 use environment_keys::EnvironmentKeys;
-use sink::{KafkaSink, KafkaSinkConfig};
+use sink::{KafkaSink, KafkaSinkConfig, Sink};
 
 const ENVIRONMENT_KEY_REFRESH_AFTER: Duration = Duration::from_secs(300);
 
@@ -33,19 +33,23 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    info!(
-        listen_addr = %config.listen_addr,
-        kafka_bootstrap_servers = %config.kafka_bootstrap_servers,
-        kafka_topic = %config.kafka_topic,
-        kafka_auth = ?config.kafka_auth,
-        "Starting flagsmith-analytics server"
-    );
-
-    let sink = KafkaSink::new(KafkaSinkConfig::new(
-        config.kafka_bootstrap_servers.clone(),
-        config.kafka_topic.clone(),
-        config.kafka_auth.clone(),
-    ))?;
+    let (sink, external_topic) = match &config.sink {
+        SinkConfig::Kafka(kafka) => {
+            info!(
+                listen_addr = %config.listen_addr,
+                kafka_bootstrap_servers = %kafka.bootstrap_servers,
+                kafka_topic = %kafka.topic,
+                kafka_auth = ?kafka.auth,
+                "Starting flagsmith-analytics server"
+            );
+            let sink = KafkaSink::new(KafkaSinkConfig::new(
+                kafka.bootstrap_servers.clone(),
+                kafka.topic.clone(),
+                kafka.auth.clone(),
+            ))?;
+            (Sink::Kafka(sink), kafka.external_topic.as_str())
+        }
+    };
 
     let pool = PgPoolOptions::new()
         .max_connections(8)
@@ -53,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
         .connect_lazy(&config.database_url)?;
     let context_state = ContextState {
         environment_keys: EnvironmentKeys::new(pool, ENVIRONMENT_KEY_REFRESH_AFTER),
-        external_topic: Arc::from(config.kafka_external_topic.as_str()),
+        external_topic: Arc::from(external_topic),
     };
 
     let app = routes::app(sink.clone(), context_state);

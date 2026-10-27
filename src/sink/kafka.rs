@@ -10,6 +10,8 @@ use rdkafka::statistics::Statistics;
 use rdkafka::util::Timeout;
 use tracing::{debug, error, info, warn};
 
+use crate::models::EventRecord;
+
 const CLIENT_ID: &str = "events-ingestion-api";
 /// How long `put` waits for room in the local queue before failing the batch.
 const ENQUEUE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -146,11 +148,17 @@ impl KafkaSink {
     pub async fn put(
         &self,
         destination: Option<&str>,
-        records: Vec<Vec<u8>>,
+        records: &[EventRecord<'_>],
     ) -> Result<(), SinkError> {
         let topic = destination.unwrap_or(&self.default_topic);
         let total = records.len();
-        let sends = records.iter().map(|bytes| {
+        let payloads: Vec<Vec<u8>> = records
+            .iter()
+            .map(|record| {
+                serde_json::to_vec(record).expect("EventRecord serialization cannot fail")
+            })
+            .collect();
+        let sends = payloads.iter().map(|bytes| {
             self.producer.send(
                 FutureRecord::<(), _>::to(topic).payload(bytes),
                 Timeout::After(ENQUEUE_TIMEOUT),

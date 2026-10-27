@@ -8,7 +8,7 @@ use rdkafka::producer::DefaultProducerContext;
 use rdkafka::Message;
 use sqlx::PgPool;
 
-use crate::sink::{KafkaAuth, KafkaSink, KafkaSinkConfig};
+use crate::sink::{KafkaAuth, KafkaSink, KafkaSinkConfig, Sink};
 
 pub(crate) const FLAGSMITH_WAREHOUSE_TOPIC: &str = "events-default";
 
@@ -18,7 +18,7 @@ pub(crate) type MockKafkaCluster = MockCluster<'static, DefaultProducerContext>;
 /// test.
 pub(crate) struct MockKafka {
     pub(crate) cluster: MockKafkaCluster,
-    pub(crate) sink: KafkaSink,
+    pub(crate) sink: Sink,
 }
 
 pub(crate) fn mock_kafka(topics: &[&str]) -> MockKafka {
@@ -32,7 +32,7 @@ pub(crate) fn mock_kafka(topics: &[&str]) -> MockKafka {
         KafkaAuth::None,
     );
     config.message_timeout = Duration::from_secs(5);
-    let sink = KafkaSink::new(config).expect("sink");
+    let sink = Sink::Kafka(KafkaSink::new(config).expect("sink"));
     MockKafka { cluster, sink }
 }
 

@@ -52,6 +52,7 @@ On the wire to Kafka, `traits` and `metadata` are produced as JSON-encoded strin
 
 | Env var | Required | Default |
 |---|---|---|
+| `SINK` | no | `kafka` (the only sink so far) |
 | `KAFKA_BOOTSTRAP_SERVERS` | yes | — |
 | `KAFKA_TOPIC` | yes | — |
 | `KAFKA_EXTERNAL_TOPIC` | yes | — |
