@@ -100,15 +100,10 @@ fn batch_from_env() -> Result<BatchConfig, ConfigError> {
             env::var("SINK_FLUSH_INTERVAL_MS").ok(),
             1000,
         )?),
-        max_rows: parse_positive(
-            "SINK_BATCH_MAX_ROWS",
-            env::var("SINK_BATCH_MAX_ROWS").ok(),
-            50_000,
-        )?,
-        max_bytes: parse_positive(
-            "SINK_BUFFER_MAX_BYTES",
-            env::var("SINK_BUFFER_MAX_BYTES").ok(),
-            64 * 1024 * 1024,
+        flush_max_events: parse_positive(
+            "SINK_FLUSH_MAX_EVENTS",
+            env::var("SINK_FLUSH_MAX_EVENTS").ok(),
+            5000,
         )?,
     })
 }

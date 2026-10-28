@@ -9,7 +9,7 @@ use super::batching::BatchWriter;
 use super::SinkError;
 use crate::models::EventRecord;
 
-/// Bounds sending and committing one batch of up to `SINK_BATCH_MAX_ROWS` rows.
+/// Bounds sending and committing one batch of up to `SINK_FLUSH_MAX_EVENTS` rows.
 const INSERT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
@@ -200,8 +200,7 @@ mod tests {
     fn batch_config(flush_interval: Duration) -> BatchConfig {
         BatchConfig {
             flush_interval,
-            max_rows: 1000,
-            max_bytes: 1024 * 1024,
+            flush_max_events: 1000,
         }
     }
 
@@ -241,7 +240,7 @@ mod tests {
             record("purchase", ts + 2),
         ];
 
-        sink.put(records).unwrap();
+        sink.put(records);
         db.wait_for_rows(2).await;
 
         let stored: Vec<StoredRow> = db
@@ -295,8 +294,7 @@ mod tests {
         );
         let record = record("purchase", now_ms());
 
-        sink.put(vec![record.clone(), record.clone(), record])
-            .unwrap();
+        sink.put(vec![record.clone(), record.clone(), record]);
         assert_eq!(db.count().await, 0);
         sink.shutdown(Duration::from_secs(5)).await;
 

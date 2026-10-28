@@ -304,10 +304,7 @@ mod tests {
     use rdkafka::types::RDKafkaRespErr;
     use tower::ServiceExt;
 
-    use crate::sink::{
-        BatchConfig, BatchingSink, ClickHouseConfig, ClickHouseWriter, KafkaAuth, KafkaSink,
-        KafkaSinkConfig,
-    };
+    use crate::sink::{KafkaAuth, KafkaSink, KafkaSinkConfig};
     use crate::test_helpers::{
         assert_topic_empty, mock_kafka, now_ms, read_records, FLAGSMITH_WAREHOUSE_TOPIC,
     };
@@ -723,38 +720,6 @@ mod tests {
             "took {:?}",
             started.elapsed()
         );
-    }
-
-    #[tokio::test]
-    async fn test_handler_full_clickhouse_buffer_returns_503() {
-        // Room for one buffered event; the unreachable server and the hour-long
-        // interval keep it buffered.
-        let sink = Sink::ClickHouse(BatchingSink::new(
-            ClickHouseWriter::new(ClickHouseConfig {
-                url: "http://127.0.0.1:1".to_string(),
-                user: "default".to_string(),
-                password: String::new(),
-                database: "flagsmith_exp".to_string(),
-                table: "events".to_string(),
-            }),
-            BatchConfig {
-                flush_interval: Duration::from_secs(3600),
-                max_rows: 1000,
-                max_bytes: 400,
-            },
-        ));
-
-        let first = app(&sink)
-            .oneshot(post_events(&purchase_json()))
-            .await
-            .unwrap();
-        let second = app(&sink)
-            .oneshot(post_events(&purchase_json()))
-            .await
-            .unwrap();
-
-        assert_eq!(first.status(), StatusCode::ACCEPTED);
-        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]

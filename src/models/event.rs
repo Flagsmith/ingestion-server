@@ -1,5 +1,3 @@
-use std::mem;
-
 use serde::{Deserialize, Serialize, Serializer};
 
 /// Reserved system event for flag-exposure tracking. `feature_name` is required
@@ -86,44 +84,6 @@ pub struct EventRecord {
     )]
     pub metadata: Option<serde_json::Value>,
     pub timestamp: i64,
-}
-
-impl EventRecord {
-    /// Approximate memory held, counted against a sink's buffer limit.
-    pub fn approx_size(&self) -> usize {
-        mem::size_of::<Self>()
-            + self.environment_key.len()
-            + self.sdk_language.len()
-            + self.sdk_version.len()
-            + self.event.len()
-            + self.feature_name.as_ref().map_or(0, String::len)
-            + self.identifier.as_ref().map_or(0, String::len)
-            + value_size(&self.value)
-            + self.traits.as_ref().map_or(0, value_size)
-            + self.metadata.as_ref().map_or(0, value_size)
-    }
-}
-
-/// Rough per-entry overhead of a JSON object's map.
-const MAP_ENTRY_OVERHEAD: usize = 32;
-
-/// Heap held by a JSON value; its inline size is counted by its parent.
-fn value_size(value: &serde_json::Value) -> usize {
-    use serde_json::Value;
-    match value {
-        Value::String(s) => s.len(),
-        Value::Array(items) => items
-            .iter()
-            .map(|item| mem::size_of::<Value>() + value_size(item))
-            .sum(),
-        Value::Object(map) => map
-            .iter()
-            .map(|(key, item)| {
-                MAP_ENTRY_OVERHEAD + key.len() + mem::size_of::<Value>() + value_size(item)
-            })
-            .sum(),
-        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
-    }
 }
 
 /// Serializes a JSON value as its encoded text, in a string.

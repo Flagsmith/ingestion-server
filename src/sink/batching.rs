@@ -25,22 +25,15 @@ pub trait BatchWriter: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct BatchConfig {
     pub flush_interval: Duration,
-    /// Flush early once this many rows are buffered; also the most rows per write.
-    pub max_rows: usize,
-    /// Bound on buffered plus in-flight rows; `put` fails beyond it.
-    pub max_bytes: usize,
-}
-
-struct Buffer {
-    records: Vec<EventRecord>,
-    /// Size of `records` plus the batch being flushed.
-    bytes: usize,
+    /// Flush early once this many events are buffered. Not a cap: the buffer
+    /// is unbounded and keeps growing while a write is slow or failing.
+    pub flush_max_events: usize,
 }
 
 struct Shared<W: BatchWriter> {
     writer: W,
     config: BatchConfig,
-    buffer: Mutex<Buffer>,
+    buffer: Mutex<Vec<EventRecord>>,
     flush_now: Notify,
     stop: Notify,
 }
@@ -68,10 +61,7 @@ impl<W: BatchWriter> BatchingSink<W> {
         let shared = Arc::new(Shared {
             writer,
             config,
-            buffer: Mutex::new(Buffer {
-                records: Vec::new(),
-                bytes: 0,
-            }),
+            buffer: Mutex::new(Vec::new()),
             flush_now: Notify::new(),
             stop: Notify::new(),
         });
@@ -82,20 +72,13 @@ impl<W: BatchWriter> BatchingSink<W> {
         }
     }
 
-    /// Buffer every record, or none of them if that would pass the byte limit.
-    pub fn put(&self, records: Vec<EventRecord>) -> Result<(), SinkError> {
-        let bytes: usize = records.iter().map(EventRecord::approx_size).sum();
-        let config = &self.shared.config;
+    /// Buffer the records; never blocks or fails.
+    pub fn put(&self, records: Vec<EventRecord>) {
         let mut buffer = self.shared.buffer.lock().expect("buffer lock");
-        if buffer.bytes + bytes > config.max_bytes {
-            return Err(SinkError::BufferFull);
-        }
-        buffer.bytes += bytes;
-        buffer.records.extend(records);
-        if buffer.records.len() >= config.max_rows {
+        buffer.extend(records);
+        if buffer.len() >= self.shared.config.flush_max_events {
             self.shared.flush_now.notify_one();
         }
-        Ok(())
     }
 
     /// Stop the flusher and write what is buffered, bounded by `timeout`.
@@ -130,15 +113,11 @@ async fn run<W: BatchWriter>(shared: Arc<Shared<W>>) {
 }
 
 async fn flush<W: BatchWriter>(shared: &Shared<W>) {
-    let records = mem::take(&mut shared.buffer.lock().expect("buffer lock").records);
+    let records = mem::take(&mut *shared.buffer.lock().expect("buffer lock"));
     if records.is_empty() {
         return;
     }
-    for chunk in records.chunks(shared.config.max_rows) {
-        write_with_retries(&shared.writer, chunk).await;
-    }
-    let flushed: usize = records.iter().map(EventRecord::approx_size).sum();
-    shared.buffer.lock().expect("buffer lock").bytes -= flushed;
+    write_with_retries(&shared.writer, &records).await;
 }
 
 async fn write_with_retries<W: BatchWriter>(writer: &W, records: &[EventRecord]) {
@@ -172,10 +151,12 @@ mod tests {
 
     use super::*;
 
-    /// Records every write attempt; fails all of them when `fail` is set.
+    /// Records every write attempt; each takes `delay`, and all fail when
+    /// `fail` is set.
     #[derive(Clone, Default)]
     struct FakeWriter {
         fail: bool,
+        delay: Duration,
         attempts: Arc<AtomicUsize>,
         written: Arc<Mutex<Vec<Vec<i64>>>>,
     }
@@ -183,8 +164,9 @@ mod tests {
     impl BatchWriter for FakeWriter {
         async fn write(&self, records: &[EventRecord]) -> Result<(), SinkError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
             if self.fail {
-                return Err(SinkError::BufferFull);
+                return Err(clickhouse::error::Error::Custom("failed".to_string()).into());
             }
             let timestamps = records.iter().map(|record| record.timestamp).collect();
             self.written.lock().unwrap().push(timestamps);
@@ -211,25 +193,19 @@ mod tests {
             .collect()
     }
 
-    /// Every test record has the same size.
-    fn record_size() -> usize {
-        records(&[0])[0].approx_size()
-    }
-
-    fn config(flush_interval: Duration, max_rows: usize, max_bytes: usize) -> BatchConfig {
+    fn config(flush_interval: Duration, flush_max_events: usize) -> BatchConfig {
         BatchConfig {
             flush_interval,
-            max_rows,
-            max_bytes,
+            flush_max_events,
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn flushes_on_the_interval() {
         let writer = FakeWriter::default();
-        let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(1), 100, 10_000));
+        let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(1), 100));
 
-        sink.put(records(&[1, 2])).unwrap();
+        sink.put(records(&[1, 2]));
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(writer.written.lock().unwrap().is_empty());
 
@@ -238,65 +214,64 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn flushes_early_on_max_rows() {
+    async fn flushes_early_at_flush_max_events() {
         let writer = FakeWriter::default();
-        let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(3600), 2, 10_000));
+        let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(3600), 2));
 
-        sink.put(records(&[1, 2])).unwrap();
+        sink.put(records(&[1]));
         tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(writer.written.lock().unwrap().is_empty());
 
+        sink.put(records(&[2]));
+        tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(*writer.written.lock().unwrap(), vec![vec![1, 2]]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn rejects_a_put_that_would_overflow_the_buffer() {
-        let writer = FakeWriter::default();
-        let sink = BatchingSink::new(
-            writer.clone(),
-            config(Duration::from_secs(3600), 100, 2 * record_size()),
+    async fn keeps_buffering_while_a_write_is_slow() {
+        let writer = FakeWriter {
+            delay: Duration::from_secs(1),
+            ..FakeWriter::default()
+        };
+        let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(3600), 2));
+
+        sink.put(records(&[1, 2]));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        // [1, 2] is being written; the buffer grows past the threshold.
+        sink.put(records(&[3, 4]));
+        sink.put(records(&[5]));
+
+        sink.shutdown(Duration::from_secs(5)).await;
+        assert_eq!(
+            *writer.written.lock().unwrap(),
+            vec![vec![1, 2], vec![3, 4, 5]]
         );
-
-        sink.put(records(&[1])).unwrap();
-        assert!(matches!(
-            sink.put(records(&[2, 3])),
-            Err(SinkError::BufferFull)
-        ));
-        sink.put(records(&[4])).unwrap();
-
-        sink.shutdown(Duration::from_secs(1)).await;
-        assert_eq!(*writer.written.lock().unwrap(), vec![vec![1, 4]]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn drops_a_batch_after_the_retries_and_frees_its_space() {
+    async fn drops_a_batch_after_the_retries() {
         let writer = FakeWriter {
             fail: true,
             ..FakeWriter::default()
         };
-        let sink = BatchingSink::new(
-            writer.clone(),
-            config(Duration::from_secs(1), 100, record_size()),
-        );
+        let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(1), 1));
 
-        sink.put(records(&[1])).unwrap();
+        sink.put(records(&[1]));
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         assert_eq!(
             writer.attempts.load(Ordering::SeqCst),
             1 + MAX_RETRIES as usize
         );
-        sink.put(records(&[2])).unwrap();
+        sink.put(records(&[2]));
     }
 
     #[tokio::test(start_paused = true)]
     async fn shutdown_writes_what_is_buffered() {
         let writer = FakeWriter::default();
-        let sink = BatchingSink::new(
-            writer.clone(),
-            config(Duration::from_secs(3600), 100, 10_000),
-        );
+        let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(3600), 100));
 
-        sink.put(records(&[1, 2, 3])).unwrap();
+        sink.put(records(&[1, 2, 3]));
         sink.shutdown(Duration::from_secs(1)).await;
 
         assert_eq!(*writer.written.lock().unwrap(), vec![vec![1, 2, 3]]);

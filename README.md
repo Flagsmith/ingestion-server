@@ -65,8 +65,7 @@ On the wire to Kafka, `traits` and `metadata` are produced as JSON-encoded strin
 | `CLICKHOUSE_DATABASE` | no | `flagsmith_exp` |
 | `CLICKHOUSE_TABLE` | no | `events` |
 | `SINK_FLUSH_INTERVAL_MS` | no | `1000` |
-| `SINK_BATCH_MAX_ROWS` | no | `50000` |
-| `SINK_BUFFER_MAX_BYTES` | no | `67108864` (64 MiB) |
+| `SINK_FLUSH_MAX_EVENTS` | no | `5000` |
 | `DATABASE_URL` | yes | — |
 | `LISTEN_ADDR` | no | `0.0.0.0:8080` |
 
@@ -89,7 +88,7 @@ With `KAFKA_AUTH=scram`, the producer authenticates with SASL/SCRAM-SHA-512 over
 
 ### ClickHouse sink
 
-With `SINK=clickhouse`, `202` means the events are buffered in memory, not yet stored. A background task writes the buffer every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_BATCH_MAX_ROWS` rows are waiting, as one `INSERT` per batch. A failed batch is retried 3 times and then dropped with an error log. Once the buffer reaches `SINK_BUFFER_MAX_BYTES`, requests get `503` until a flush frees space. A normal shutdown (SIGTERM) flushes the buffer, but events still buffered are lost if the process crashes.
+With `SINK=clickhouse`, `202` means the events are buffered in memory, not yet stored. A background task takes the whole buffer every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_FLUSH_MAX_EVENTS` events are waiting, and writes it as one `INSERT`. A failed batch is retried 3 times and then dropped with an error log. The buffer is unbounded: requests never wait or get `503`, so while a write is slow or failing (up to about 2 minutes with retries) it grows by the ingest rate times the write time, and the next flush takes it all. A normal shutdown (SIGTERM) flushes the buffer, but events still buffered are lost if the process crashes.
 
 ## Run locally
 

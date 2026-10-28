@@ -28,7 +28,10 @@ impl Sink {
         match self {
             Self::Kafka(sink) => Ok(sink.put(destination, &records).await?),
             // A single table: there is no per-environment destination.
-            Self::ClickHouse(sink) => sink.put(records),
+            Self::ClickHouse(sink) => {
+                sink.put(records);
+                Ok(())
+            }
         }
     }
 
@@ -55,6 +58,4 @@ pub enum SinkError {
     Kafka(#[from] kafka::DeliveryError),
     #[error("ClickHouse insert failed: {0}")]
     ClickHouse(#[from] ::clickhouse::error::Error),
-    #[error("Sink buffer is full")]
-    BufferFull,
 }
