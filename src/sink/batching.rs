@@ -38,9 +38,6 @@ struct Shared<W: BatchWriter> {
     stop: Notify,
 }
 
-/// Buffers records in memory and writes them in batches from one background
-/// task. `put` returns once the records are buffered, so records still
-/// buffered are lost if the process dies.
 pub struct BatchingSink<W: BatchWriter> {
     shared: Arc<Shared<W>>,
     flusher: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -56,7 +53,6 @@ impl<W: BatchWriter> Clone for BatchingSink<W> {
 }
 
 impl<W: BatchWriter> BatchingSink<W> {
-    /// Starts the flusher task; needs a Tokio runtime.
     pub fn new(writer: W, config: BatchConfig) -> Self {
         let shared = Arc::new(Shared {
             writer,
@@ -201,7 +197,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn flushes_on_the_interval() {
+    async fn test_flushes_on_the_interval() {
         let writer = FakeWriter::default();
         let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(1), 100));
 
@@ -214,7 +210,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn flushes_early_at_flush_max_events() {
+    async fn test_flushes_early_at_flush_max_events() {
         let writer = FakeWriter::default();
         let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(3600), 2));
 
@@ -228,7 +224,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn keeps_buffering_while_a_write_is_slow() {
+    async fn test_keeps_buffering_while_a_write_is_slow() {
         let writer = FakeWriter {
             delay: Duration::from_secs(1),
             ..FakeWriter::default()
@@ -249,7 +245,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn drops_a_batch_after_the_retries() {
+    async fn test_drops_a_batch_after_the_retries() {
         let writer = FakeWriter {
             fail: true,
             ..FakeWriter::default()
@@ -267,7 +263,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn shutdown_writes_what_is_buffered() {
+    async fn test_shutdown_writes_what_is_buffered() {
         let writer = FakeWriter::default();
         let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(3600), 100));
 
@@ -278,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn backoff_doubles_within_the_jitter_band() {
+    fn test_backoff_doubles_within_the_jitter_band() {
         for retry in 0..MAX_RETRIES {
             let base = RETRY_BASE_DELAY * 2u32.pow(retry);
             let delay = backoff(retry);

@@ -209,12 +209,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_positive_defaults_when_unset() {
+    fn test_parse_positive_defaults_when_unset() {
         assert_eq!(parse_positive("N", None, 1000u64).unwrap(), 1000);
     }
 
     #[test]
-    fn parse_positive_reads_a_positive_integer() {
+    fn test_parse_positive_reads_a_positive_integer() {
         assert_eq!(
             parse_positive("N", Some("50".to_string()), 1000usize).unwrap(),
             50
@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_positive_rejects_zero_and_non_numbers() {
+    fn test_parse_positive_rejects_zero_and_non_numbers() {
         for value in ["0", "-1", "ten", ""] {
             assert!(matches!(
                 parse_positive("N", Some(value.to_string()), 1000u64),

@@ -207,7 +207,7 @@ impl ClickHouseTestDatabase {
         panic!("expected {n} rows within 10s, found {}", self.count().await);
     }
 
-    pub(crate) async fn drop(self) {
+    pub(crate) async fn drop_db(self) {
         self.client
             .query(&format!("DROP DATABASE {}", self.config.database))
             .execute()

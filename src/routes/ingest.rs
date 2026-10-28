@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn test_event_record_omits_nulls_and_renames_fields() {
+    fn test_event_record_omits_absent_fields() {
         let batch = parse(
             r#"{"events":[{"event":"$flag_exposure","feature_name":"dark_mode","identifier":"user_1","value":"control","timestamp":1700000000000}]}"#,
         );

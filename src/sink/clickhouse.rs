@@ -33,9 +33,8 @@ impl fmt::Debug for ClickHouseConfig {
     }
 }
 
-/// One row of the `events` table, borrowed from its record. Field names are
-/// the column names. Every column is non-Nullable, so absent optionals are
-/// written as "", as ClickPipes does.
+/// Field names must match the `events` columns. Every column is
+/// non-Nullable, so absent optionals are written as "", as ClickPipes does.
 #[derive(Debug, PartialEq, Row, Serialize)]
 struct ClickHouseRow<'a> {
     environment_key: &'a str,
@@ -61,28 +60,29 @@ impl<'a> From<&'a EventRecord> for ClickHouseRow<'a> {
             timestamp: record.timestamp,
             collected_at: record.collected_at,
             identifier: record.identifier.as_deref().unwrap_or_default(),
-            value: value_column(&record.value),
-            traits: json_column(record.traits.as_ref()),
-            metadata: json_column(record.metadata.as_ref()),
+            value: value_to_text(&record.value),
+            traits: record
+                .traits
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+            metadata: record
+                .metadata
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
             sdk_language: &record.sdk_language,
             sdk_version: &record.sdk_version,
         }
     }
 }
 
-/// `value` is a String column: a JSON string goes in raw, null as "", and
-/// anything else as its JSON text.
-fn value_column(value: &serde_json::Value) -> Cow<'_, str> {
+fn value_to_text(value: &serde_json::Value) -> Cow<'_, str> {
     match value {
         serde_json::Value::String(s) => Cow::Borrowed(s),
         serde_json::Value::Null => Cow::Borrowed(""),
         other => Cow::Owned(other.to_string()),
     }
-}
-
-/// JSON text, or "" when absent.
-fn json_column(value: Option<&serde_json::Value>) -> String {
-    value.map(ToString::to_string).unwrap_or_default()
 }
 
 pub struct ClickHouseWriter {
@@ -108,7 +108,6 @@ impl ClickHouseWriter {
 
 impl BatchWriter for ClickHouseWriter {
     /// One plain `INSERT` per batch; succeeds once ClickHouse has committed it.
-    /// Rows are built one at a time, so the batch is never copied whole.
     async fn write(&self, records: &[EventRecord]) -> Result<(), SinkError> {
         let mut insert = self
             .client
@@ -149,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn row_fills_every_column_and_blanks_absent_optionals() {
+    fn test_absent_optionals_become_empty_strings() {
         let record = EventRecord {
             value: json!(42),
             traits: Some(json!({"plan": "pro"})),
@@ -175,16 +174,16 @@ mod tests {
     }
 
     #[test]
-    fn value_column_writes_strings_raw_and_null_as_empty() {
-        assert_eq!(value_column(&json!("control")), "control");
-        assert_eq!(value_column(&json!(null)), "");
-        assert_eq!(value_column(&json!(42)), "42");
-        assert_eq!(value_column(&json!(true)), "true");
-        assert_eq!(value_column(&json!({"a": [1, 2]})), r#"{"a":[1,2]}"#);
+    fn test_value_to_text_leaves_strings_unquoted() {
+        assert_eq!(value_to_text(&json!("control")), "control");
+        assert_eq!(value_to_text(&json!(null)), "");
+        assert_eq!(value_to_text(&json!(42)), "42");
+        assert_eq!(value_to_text(&json!(true)), "true");
+        assert_eq!(value_to_text(&json!({"a": [1, 2]})), r#"{"a":[1,2]}"#);
     }
 
     #[test]
-    fn debug_output_omits_the_password() {
+    fn test_debug_output_omits_the_password() {
         let config = ClickHouseConfig {
             url: "https://clickhouse:8443".to_string(),
             user: "ingest".to_string(),
@@ -221,7 +220,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flushed_rows_land_in_the_events_table() {
+    async fn test_flushed_rows_land_in_the_events_table() {
         let db = ClickHouseTestDatabase::create().await;
         let sink = BatchingSink::new(
             ClickHouseWriter::new(db.config.clone()),
@@ -282,11 +281,11 @@ mod tests {
         );
 
         sink.shutdown(Duration::from_secs(5)).await;
-        db.drop().await;
+        db.drop_db().await;
     }
 
     #[tokio::test]
-    async fn shutdown_writes_buffered_rows() {
+    async fn test_shutdown_writes_buffered_rows() {
         let db = ClickHouseTestDatabase::create().await;
         let sink = BatchingSink::new(
             ClickHouseWriter::new(db.config.clone()),
@@ -299,6 +298,6 @@ mod tests {
         sink.shutdown(Duration::from_secs(5)).await;
 
         assert_eq!(db.count().await, 3);
-        db.drop().await;
+        db.drop_db().await;
     }
 }
