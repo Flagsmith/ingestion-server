@@ -33,8 +33,8 @@ impl Config {
         let sink = match parse_sink(env::var("SINK").ok().as_deref())? {
             SinkKind::Kafka => SinkConfig::Kafka(KafkaConfig::from_env()?),
             SinkKind::ClickHouse => SinkConfig::ClickHouse {
-                clickhouse: clickhouse_from_env()?,
-                batch: batch_from_env()?,
+                clickhouse: clickhouse_config_from_env()?,
+                batch: batch_config_from_env()?,
             },
         };
 
@@ -82,7 +82,7 @@ fn parse_sink(value: Option<&str>) -> Result<SinkKind, ConfigError> {
     }
 }
 
-fn clickhouse_from_env() -> Result<ClickHouseConfig, ConfigError> {
+fn clickhouse_config_from_env() -> Result<ClickHouseConfig, ConfigError> {
     Ok(ClickHouseConfig {
         url: required("CLICKHOUSE_URL")?,
         user: env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string()),
@@ -93,7 +93,7 @@ fn clickhouse_from_env() -> Result<ClickHouseConfig, ConfigError> {
 }
 
 /// Shared by every batching sink.
-fn batch_from_env() -> Result<BatchConfig, ConfigError> {
+fn batch_config_from_env() -> Result<BatchConfig, ConfigError> {
     Ok(BatchConfig {
         flush_interval: Duration::from_millis(positive_env_var("SINK_FLUSH_INTERVAL_MS", 1000)?),
         flush_max_events: positive_env_var("SINK_FLUSH_MAX_EVENTS", 5000)?,
