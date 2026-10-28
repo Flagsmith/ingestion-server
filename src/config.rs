@@ -5,34 +5,69 @@ use crate::sink::KafkaAuth;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub listen_addr: String,
-    pub kafka_bootstrap_servers: String,
-    pub kafka_topic: String,
-    pub kafka_external_topic: String,
-    pub kafka_auth: KafkaAuth,
+    pub sink: SinkConfig,
     pub database_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum SinkConfig {
+    Kafka(KafkaConfig),
+}
+
+#[derive(Debug, Clone)]
+pub struct KafkaConfig {
+    pub bootstrap_servers: String,
+    pub topic: String,
+    pub external_topic: String,
+    pub auth: KafkaAuth,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let kafka_auth = parse_auth(
+        let sink = match parse_sink(env::var("SINK").ok().as_deref())? {
+            SinkKind::Kafka => SinkConfig::Kafka(KafkaConfig::from_env()?),
+        };
+
+        Ok(Config {
+            listen_addr: env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
+            sink,
+            database_url: required("DATABASE_URL")?,
+        })
+    }
+}
+
+impl KafkaConfig {
+    fn from_env() -> Result<Self, ConfigError> {
+        let auth = parse_auth(
             &env::var("KAFKA_AUTH").unwrap_or_else(|_| "scram".to_string()),
             env::var("KAFKA_USERNAME").ok(),
             env::var("KAFKA_PASSWORD").ok(),
         )?;
 
-        Ok(Config {
-            listen_addr: env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
-            kafka_bootstrap_servers: required("KAFKA_BOOTSTRAP_SERVERS")?,
-            kafka_topic: required("KAFKA_TOPIC")?,
-            kafka_external_topic: required("KAFKA_EXTERNAL_TOPIC")?,
-            kafka_auth,
-            database_url: required("DATABASE_URL")?,
+        Ok(KafkaConfig {
+            bootstrap_servers: required("KAFKA_BOOTSTRAP_SERVERS")?,
+            topic: required("KAFKA_TOPIC")?,
+            external_topic: required("KAFKA_EXTERNAL_TOPIC")?,
+            auth,
         })
     }
 }
 
 fn required(name: &'static str) -> Result<String, ConfigError> {
     env::var(name).map_err(|_| ConfigError::MissingRequired(name))
+}
+
+#[derive(Debug, PartialEq)]
+enum SinkKind {
+    Kafka,
+}
+
+/// Which sink `SINK` selects; unset means Kafka.
+fn parse_sink(value: Option<&str>) -> Result<SinkKind, ConfigError> {
+    match value.unwrap_or("kafka") {
+        "kafka" => Ok(SinkKind::Kafka),
+        other => Err(ConfigError::InvalidSink(other.to_string())),
+    }
 }
 
 fn parse_auth(
@@ -56,6 +91,8 @@ pub enum ConfigError {
     MissingRequired(&'static str),
     #[error("Invalid value for {0}: {1:?} (expected scram or none)")]
     Invalid(&'static str, String),
+    #[error("Invalid value for SINK: {0:?} (expected kafka)")]
+    InvalidSink(String),
 }
 
 #[cfg(test)]
@@ -96,6 +133,20 @@ mod tests {
         assert!(matches!(
             parse_auth("iam", None, None),
             Err(ConfigError::Invalid("KAFKA_AUTH", v)) if v == "iam"
+        ));
+    }
+
+    #[test]
+    fn parse_sink_defaults_to_kafka() {
+        assert_eq!(parse_sink(None).unwrap(), SinkKind::Kafka);
+        assert_eq!(parse_sink(Some("kafka")).unwrap(), SinkKind::Kafka);
+    }
+
+    #[test]
+    fn parse_sink_rejects_unknown_value() {
+        assert!(matches!(
+            parse_sink(Some("clickhouse")),
+            Err(ConfigError::InvalidSink(v)) if v == "clickhouse"
         ));
     }
 }

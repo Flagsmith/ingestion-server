@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 /// Reserved system event for flag-exposure tracking. `feature_name` is required
 /// for events of this type.
@@ -73,9 +73,26 @@ pub struct EventRecord<'a> {
     pub identifier: Option<&'a str>,
     #[serde(skip_serializing_if = "serde_json::Value::is_null")]
     pub value: &'a serde_json::Value,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub traits: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "json_string"
+    )]
+    pub traits: Option<&'a serde_json::Value>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "json_string"
+    )]
+    pub metadata: Option<&'a serde_json::Value>,
     pub timestamp: i64,
+}
+
+/// Serializes a JSON value as its encoded text, in a string.
+fn json_string<S: Serializer>(
+    value: &Option<&serde_json::Value>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(value) => serializer.collect_str(value),
+        None => serializer.serialize_none(),
+    }
 }

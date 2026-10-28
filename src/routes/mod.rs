@@ -6,12 +6,12 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::decompression::RequestDecompressionLayer;
 
 use crate::auth::{extract_environment_context, ContextState};
-use crate::sink::KafkaSink;
+use crate::sink::Sink;
 
 pub use health::health_check;
 pub use ingest::ingest_batch;
 
-pub fn app(sink: KafkaSink, context_state: ContextState) -> Router {
+pub fn app(sink: Sink, context_state: ContextState) -> Router {
     Router::new()
         .route("/health", get(health_check))
         .route(

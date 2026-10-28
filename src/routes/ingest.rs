@@ -12,7 +12,7 @@ use crate::lookup::mask_key;
 use crate::models::{
     Event, EventBatch, EventRecord, IngestResponse, RejectedEvent, FLAG_EXPOSURE_EVENT,
 };
-use crate::sink::KafkaSink;
+use crate::sink::Sink;
 
 /// Header-derived fields are copied into every record of the batch, so an
 /// unbounded header would inflate every record.
@@ -177,15 +177,15 @@ fn partition_events(events: &[Event]) -> (Vec<&Event>, Vec<RejectedEvent>) {
 }
 
 /// POST /v1/events
-/// Validates each event independently: valid events are serialized and
-/// forwarded to the sink, invalid ones are reported back as `rejected`
-/// entries without blocking the rest of the batch.
+/// Validates each event independently: valid events are forwarded to the
+/// sink, invalid ones are reported back as `rejected` entries without
+/// blocking the rest of the batch.
 /// Returns 202 when at least one event was accepted and forwarded, 400 when
 /// none were (all invalid, or empty batch), 503 on sink failure
 /// (delivery not confirmed; retrying is safe but may duplicate events from
 /// a partially delivered batch).
 pub async fn ingest_batch(
-    State(sink): State<KafkaSink>,
+    State(sink): State<Sink>,
     Extension(ctx): Extension<EnvironmentContext>,
     headers: HeaderMap,
     Json(batch): Json<EventBatch>,
@@ -225,28 +225,26 @@ pub async fn ingest_batch(
         .map(parse_sdk_user_agent)
         .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
 
-    let records: Vec<Vec<u8>> = valid
+    // TODO: move this to a method.
+    let records: Vec<EventRecord> = valid
         .iter()
-        .map(|event| {
-            let record = EventRecord {
-                environment_key: &ctx.client_api_key,
-                collected_at,
-                sdk_language: &sdk_language,
-                sdk_version: &sdk_version,
-                event: &event.event,
-                feature_name: event.feature_name.as_deref(),
-                identifier: event.identifier.as_deref(),
-                value: &event.value,
-                traits: event.traits.as_ref().map(ToString::to_string),
-                metadata: event.metadata.as_ref().map(ToString::to_string),
-                timestamp: event.timestamp,
-            };
-            serde_json::to_vec(&record).expect("EventRecord serialization cannot fail")
+        .map(|event| EventRecord {
+            environment_key: &ctx.client_api_key,
+            collected_at,
+            sdk_language: &sdk_language,
+            sdk_version: &sdk_version,
+            event: &event.event,
+            feature_name: event.feature_name.as_deref(),
+            identifier: event.identifier.as_deref(),
+            value: &event.value,
+            traits: event.traits.as_ref(),
+            metadata: event.metadata.as_ref(),
+            timestamp: event.timestamp,
         })
         .collect();
 
     let record_count = records.len();
-    match sink.put(ctx.destination.as_deref(), records).await {
+    match sink.put(ctx.destination.as_deref(), &records).await {
         Ok(()) => {
             debug!(
                 client_api_key = %mask_key(&ctx.client_api_key),
@@ -288,7 +286,7 @@ mod tests {
     use rdkafka::types::RDKafkaRespErr;
     use tower::ServiceExt;
 
-    use crate::sink::{KafkaAuth, KafkaSinkConfig};
+    use crate::sink::{KafkaAuth, KafkaSink, KafkaSinkConfig};
     use crate::test_helpers::{
         assert_topic_empty, mock_kafka, read_records, FLAGSMITH_WAREHOUSE_TOPIC,
     };
@@ -514,8 +512,8 @@ mod tests {
             feature_name: event.feature_name.as_deref(),
             identifier: event.identifier.as_deref(),
             value: &event.value,
-            traits: event.traits.as_ref().map(ToString::to_string),
-            metadata: event.metadata.as_ref().map(ToString::to_string),
+            traits: event.traits.as_ref(),
+            metadata: event.metadata.as_ref(),
             timestamp: event.timestamp,
         };
 
@@ -534,17 +532,17 @@ mod tests {
     }
 
     /// A sink whose bootstrap server never answers, so every put times out.
-    fn unreachable_sink() -> KafkaSink {
+    fn unreachable_sink() -> Sink {
         let mut config = KafkaSinkConfig::new(
             "127.0.0.1:1".to_string(),
             FLAGSMITH_WAREHOUSE_TOPIC.to_string(),
             KafkaAuth::None,
         );
         config.message_timeout = Duration::from_secs(2);
-        KafkaSink::new(config).expect("sink")
+        Sink::Kafka(KafkaSink::new(config).expect("sink"))
     }
 
-    fn app_with_destination(sink: &KafkaSink, destination: Option<&str>) -> Router {
+    fn app_with_destination(sink: &Sink, destination: Option<&str>) -> Router {
         let ctx = EnvironmentContext {
             client_api_key: Arc::from("test-client-key"),
             destination: destination.map(Arc::from),
@@ -555,7 +553,7 @@ mod tests {
             .with_state(sink.clone())
     }
 
-    fn app(sink: &KafkaSink) -> Router {
+    fn app(sink: &Sink) -> Router {
         app_with_destination(sink, None)
     }
 

@@ -1,7 +1,7 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
 
-use crate::sink::KafkaSink;
+use crate::sink::Sink;
 
 #[derive(Serialize)]
 pub struct HealthResponse {
@@ -12,7 +12,7 @@ pub struct HealthResponse {
 
 /// Liveness plus one local check: a fatal producer error is permanent, so
 /// report it and let ECS replace the task. No downstream call, so this cannot hang.
-pub async fn health_check(State(sink): State<KafkaSink>) -> (StatusCode, Json<HealthResponse>) {
+pub async fn health_check(State(sink): State<Sink>) -> (StatusCode, Json<HealthResponse>) {
     match sink.fatal_error() {
         None => (
             StatusCode::OK,
