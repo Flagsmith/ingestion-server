@@ -95,25 +95,16 @@ fn clickhouse_from_env() -> Result<ClickHouseConfig, ConfigError> {
 /// Shared by every batching sink.
 fn batch_from_env() -> Result<BatchConfig, ConfigError> {
     Ok(BatchConfig {
-        flush_interval: Duration::from_millis(parse_positive(
-            "SINK_FLUSH_INTERVAL_MS",
-            env::var("SINK_FLUSH_INTERVAL_MS").ok(),
-            1000,
-        )?),
-        flush_max_events: parse_positive(
-            "SINK_FLUSH_MAX_EVENTS",
-            env::var("SINK_FLUSH_MAX_EVENTS").ok(),
-            5000,
-        )?,
+        flush_interval: Duration::from_millis(positive_env_var("SINK_FLUSH_INTERVAL_MS", 1000)?),
+        flush_max_events: positive_env_var("SINK_FLUSH_MAX_EVENTS", 5000)?,
     })
 }
 
-fn parse_positive<T: FromStr + Default + PartialOrd>(
+fn positive_env_var<T: FromStr + Default + PartialOrd>(
     name: &'static str,
-    value: Option<String>,
     default: T,
 ) -> Result<T, ConfigError> {
-    match value {
+    match env::var(name).ok() {
         None => Ok(default),
         Some(v) => match v.parse() {
             Ok(n) if n > T::default() => Ok(n),
@@ -208,25 +199,34 @@ mod tests {
         ));
     }
 
+    // Each test uses its own variable, since the environment is shared
+    // across test threads.
+
     #[test]
-    fn test_parse_positive_defaults_when_unset() {
-        assert_eq!(parse_positive("N", None, 1000u64).unwrap(), 1000);
+    fn test_positive_env_var_defaults_when_unset() {
+        assert_eq!(
+            positive_env_var("TEST_POSITIVE_ENV_VAR_UNSET", 1000u64).unwrap(),
+            1000
+        );
     }
 
     #[test]
-    fn test_parse_positive_reads_a_positive_integer() {
+    fn test_positive_env_var_reads_a_positive_integer() {
+        env::set_var("TEST_POSITIVE_ENV_VAR_SET", "50");
         assert_eq!(
-            parse_positive("N", Some("50".to_string()), 1000usize).unwrap(),
+            positive_env_var("TEST_POSITIVE_ENV_VAR_SET", 1000usize).unwrap(),
             50
         );
     }
 
     #[test]
-    fn test_parse_positive_rejects_zero_and_non_numbers() {
+    fn test_positive_env_var_rejects_zero_and_non_numbers() {
+        const NAME: &str = "TEST_POSITIVE_ENV_VAR_INVALID";
         for value in ["0", "-1", "ten", ""] {
+            env::set_var(NAME, value);
             assert!(matches!(
-                parse_positive("N", Some(value.to_string()), 1000u64),
-                Err(ConfigError::InvalidNumber("N", v)) if v == value
+                positive_env_var(NAME, 1000u64),
+                Err(ConfigError::InvalidNumber(NAME, v)) if v == value
             ));
         }
     }
