@@ -1,5 +1,5 @@
+use std::borrow::Cow;
 use std::fmt;
-use std::mem;
 use std::time::Duration;
 
 use clickhouse::{Client, Compression, Row};
@@ -33,34 +33,56 @@ impl fmt::Debug for ClickHouseSinkConfig {
     }
 }
 
-/// One row of the `events` table. Field names are the column names. Every
-/// column is non-Nullable, so absent optionals are written as "", as
-/// ClickPipes does.
+/// One row of the `events` table, borrowed from its record. Field names are
+/// the column names. Every column is non-Nullable, so absent optionals are
+/// written as "", as ClickPipes does.
 #[derive(Debug, PartialEq, Row, Serialize)]
-#[cfg_attr(test, derive(serde::Deserialize))]
-pub struct ClickHouseRow {
-    environment_key: String,
-    event: String,
-    feature_name: String,
+struct ClickHouseRow<'a> {
+    environment_key: &'a str,
+    event: &'a str,
+    feature_name: &'a str,
     /// DateTime64(3), sent as epoch millis.
     timestamp: i64,
     collected_at: i64,
-    identifier: String,
-    value: String,
+    identifier: &'a str,
+    value: Cow<'a, str>,
     traits: String,
     metadata: String,
-    sdk_language: String,
-    sdk_version: String,
+    sdk_language: &'a str,
+    sdk_version: &'a str,
+}
+
+impl<'a> From<&'a EventRecord> for ClickHouseRow<'a> {
+    fn from(record: &'a EventRecord) -> Self {
+        ClickHouseRow {
+            environment_key: &record.environment_key,
+            event: &record.event,
+            feature_name: record.feature_name.as_deref().unwrap_or_default(),
+            timestamp: record.timestamp,
+            collected_at: record.collected_at,
+            identifier: record.identifier.as_deref().unwrap_or_default(),
+            value: value_column(&record.value),
+            traits: json_column(record.traits.as_ref()),
+            metadata: json_column(record.metadata.as_ref()),
+            sdk_language: &record.sdk_language,
+            sdk_version: &record.sdk_version,
+        }
+    }
 }
 
 /// `value` is a String column: a JSON string goes in raw, null as "", and
 /// anything else as its JSON text.
-fn value_column(value: &serde_json::Value) -> String {
+fn value_column(value: &serde_json::Value) -> Cow<'_, str> {
     match value {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Null => String::new(),
-        other => other.to_string(),
+        serde_json::Value::String(s) => Cow::Borrowed(s),
+        serde_json::Value::Null => Cow::Borrowed(""),
+        other => Cow::Owned(other.to_string()),
     }
+}
+
+/// JSON text, or "" when absent.
+fn json_column(value: Option<&serde_json::Value>) -> String {
+    value.map(ToString::to_string).unwrap_or_default()
 }
 
 pub struct ClickHouseWriter {
@@ -85,46 +107,16 @@ impl ClickHouseWriter {
 }
 
 impl BatchWriter for ClickHouseWriter {
-    type Row = ClickHouseRow;
-
-    fn row(record: &EventRecord<'_>) -> ClickHouseRow {
-        ClickHouseRow {
-            environment_key: record.environment_key.to_string(),
-            event: record.event.to_string(),
-            feature_name: record.feature_name.unwrap_or_default().to_string(),
-            timestamp: record.timestamp,
-            collected_at: record.collected_at,
-            identifier: record.identifier.unwrap_or_default().to_string(),
-            value: value_column(record.value),
-            traits: record.traits.map(ToString::to_string).unwrap_or_default(),
-            metadata: record.metadata.map(ToString::to_string).unwrap_or_default(),
-            sdk_language: record.sdk_language.to_string(),
-            sdk_version: record.sdk_version.to_string(),
-        }
-    }
-
-    fn row_size(row: &ClickHouseRow) -> usize {
-        mem::size_of::<ClickHouseRow>()
-            + row.environment_key.len()
-            + row.event.len()
-            + row.feature_name.len()
-            + row.identifier.len()
-            + row.value.len()
-            + row.traits.len()
-            + row.metadata.len()
-            + row.sdk_language.len()
-            + row.sdk_version.len()
-    }
-
     /// One plain `INSERT` per batch; succeeds once ClickHouse has committed it.
-    async fn write(&self, rows: &[ClickHouseRow]) -> Result<(), SinkError> {
+    /// Rows are built one at a time, so the batch is never copied whole.
+    async fn write(&self, records: &[EventRecord]) -> Result<(), SinkError> {
         let mut insert = self
             .client
-            .insert::<ClickHouseRow>(&self.table)
+            .insert::<ClickHouseRow<'_>>(&self.table)
             .await?
             .with_timeouts(Some(INSERT_TIMEOUT), Some(INSERT_TIMEOUT));
-        for row in rows {
-            insert.write(row).await?;
+        for record in records {
+            insert.write(&ClickHouseRow::from(record)).await?;
         }
         insert.end().await?;
         Ok(())
@@ -133,44 +125,51 @@ impl BatchWriter for ClickHouseWriter {
 
 #[cfg(test)]
 mod tests {
+    use serde::Deserialize;
     use serde_json::json;
 
     use super::*;
     use crate::sink::{BatchConfig, BatchingSink};
     use crate::test_helpers::{now_ms, ClickHouseTestDatabase};
 
-    #[test]
-    fn row_fills_every_column_and_blanks_absent_optionals() {
-        let value = json!(42);
-        let traits = json!({"plan": "pro"});
-        let record = EventRecord {
-            environment_key: "env",
-            collected_at: 1_700_000_000_001,
-            sdk_language: "python",
-            sdk_version: "1.0.0",
-            event: "purchase",
+    fn record(event: &str, timestamp: i64) -> EventRecord {
+        EventRecord {
+            environment_key: "env".to_string(),
+            collected_at: timestamp + 1,
+            sdk_language: "python".to_string(),
+            sdk_version: "1.0.0".to_string(),
+            event: event.to_string(),
             feature_name: None,
             identifier: None,
-            value: &value,
-            traits: Some(&traits),
+            value: serde_json::Value::Null,
+            traits: None,
             metadata: None,
-            timestamp: 1_700_000_000_000,
+            timestamp,
+        }
+    }
+
+    #[test]
+    fn row_fills_every_column_and_blanks_absent_optionals() {
+        let record = EventRecord {
+            value: json!(42),
+            traits: Some(json!({"plan": "pro"})),
+            ..record("purchase", 1_700_000_000_000)
         };
 
         assert_eq!(
-            ClickHouseWriter::row(&record),
+            ClickHouseRow::from(&record),
             ClickHouseRow {
-                environment_key: "env".to_string(),
-                event: "purchase".to_string(),
-                feature_name: String::new(),
+                environment_key: "env",
+                event: "purchase",
+                feature_name: "",
                 timestamp: 1_700_000_000_000,
                 collected_at: 1_700_000_000_001,
-                identifier: String::new(),
-                value: "42".to_string(),
+                identifier: "",
+                value: Cow::Borrowed("42"),
                 traits: r#"{"plan":"pro"}"#.to_string(),
                 metadata: String::new(),
-                sdk_language: "python".to_string(),
-                sdk_version: "1.0.0".to_string(),
+                sdk_language: "python",
+                sdk_version: "1.0.0",
             }
         );
     }
@@ -206,6 +205,22 @@ mod tests {
         }
     }
 
+    /// A row as read back from the table.
+    #[derive(Debug, PartialEq, Row, Deserialize)]
+    struct StoredRow {
+        environment_key: String,
+        event: String,
+        feature_name: String,
+        timestamp: i64,
+        collected_at: i64,
+        identifier: String,
+        value: String,
+        traits: String,
+        metadata: String,
+        sdk_language: String,
+        sdk_version: String,
+    }
+
     #[tokio::test]
     async fn flushed_rows_land_in_the_events_table() {
         let db = ClickHouseTestDatabase::create().await;
@@ -214,52 +229,58 @@ mod tests {
             batch_config(Duration::from_millis(100)),
         );
         let ts = now_ms();
-        let control = json!("control");
-        let null = json!(null);
-        let traits = json!({"plan": "pro"});
-        let metadata = json!({"source": "csv"});
-        let records = [
+        let records = vec![
             EventRecord {
-                environment_key: "env",
-                collected_at: ts + 1,
-                sdk_language: "python",
-                sdk_version: "1.0.0",
-                event: "$flag_exposure",
-                feature_name: Some("dark_mode"),
-                identifier: Some("user_1"),
-                value: &control,
-                traits: Some(&traits),
-                metadata: Some(&metadata),
-                timestamp: ts,
+                feature_name: Some("dark_mode".to_string()),
+                identifier: Some("user_1".to_string()),
+                value: json!("control"),
+                traits: Some(json!({"plan": "pro"})),
+                metadata: Some(json!({"source": "csv"})),
+                ..record("$flag_exposure", ts)
             },
-            EventRecord {
-                environment_key: "env",
-                collected_at: ts + 1,
-                sdk_language: "python",
-                sdk_version: "1.0.0",
-                event: "purchase",
-                feature_name: None,
-                identifier: None,
-                value: &null,
-                traits: None,
-                metadata: None,
-                timestamp: ts + 2,
-            },
+            record("purchase", ts + 2),
         ];
 
-        sink.put(&records).unwrap();
+        sink.put(records).unwrap();
         db.wait_for_rows(2).await;
 
-        let stored: Vec<ClickHouseRow> = db
+        let stored: Vec<StoredRow> = db
             .client
             .query("SELECT ?fields FROM events ORDER BY timestamp")
             .fetch_all()
             .await
             .unwrap();
-        let expected: Vec<ClickHouseRow> = records.iter().map(ClickHouseWriter::row).collect();
-        assert_eq!(stored, expected);
-        assert_eq!(stored[0].value, "control");
-        assert_eq!(stored[1].value, "");
+        assert_eq!(
+            stored,
+            vec![
+                StoredRow {
+                    environment_key: "env".to_string(),
+                    event: "$flag_exposure".to_string(),
+                    feature_name: "dark_mode".to_string(),
+                    timestamp: ts,
+                    collected_at: ts + 1,
+                    identifier: "user_1".to_string(),
+                    value: "control".to_string(),
+                    traits: r#"{"plan":"pro"}"#.to_string(),
+                    metadata: r#"{"source":"csv"}"#.to_string(),
+                    sdk_language: "python".to_string(),
+                    sdk_version: "1.0.0".to_string(),
+                },
+                StoredRow {
+                    environment_key: "env".to_string(),
+                    event: "purchase".to_string(),
+                    feature_name: String::new(),
+                    timestamp: ts + 2,
+                    collected_at: ts + 3,
+                    identifier: String::new(),
+                    value: String::new(),
+                    traits: String::new(),
+                    metadata: String::new(),
+                    sdk_language: "python".to_string(),
+                    sdk_version: "1.0.0".to_string(),
+                },
+            ]
+        );
 
         sink.shutdown(Duration::from_secs(5)).await;
         db.drop().await;
@@ -272,22 +293,10 @@ mod tests {
             ClickHouseWriter::new(db.config.clone()),
             batch_config(Duration::from_secs(3600)),
         );
-        let value = json!(42);
-        let record = EventRecord {
-            environment_key: "env",
-            collected_at: now_ms(),
-            sdk_language: "rust",
-            sdk_version: "1.0.0",
-            event: "purchase",
-            feature_name: None,
-            identifier: None,
-            value: &value,
-            traits: None,
-            metadata: None,
-            timestamp: now_ms(),
-        };
+        let record = record("purchase", now_ms());
 
-        sink.put(&[record.clone(), record.clone(), record]).unwrap();
+        sink.put(vec![record.clone(), record.clone(), record])
+            .unwrap();
         assert_eq!(db.count().await, 0);
         sink.shutdown(Duration::from_secs(5)).await;
 

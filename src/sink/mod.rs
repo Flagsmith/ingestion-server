@@ -23,10 +23,10 @@ impl Sink {
     pub async fn put(
         &self,
         destination: Option<&str>,
-        records: &[EventRecord<'_>],
+        records: Vec<EventRecord>,
     ) -> Result<(), SinkError> {
         match self {
-            Self::Kafka(sink) => Ok(sink.put(destination, records).await?),
+            Self::Kafka(sink) => Ok(sink.put(destination, &records).await?),
             // A single table: there is no per-environment destination.
             Self::ClickHouse(sink) => sink.put(records),
         }

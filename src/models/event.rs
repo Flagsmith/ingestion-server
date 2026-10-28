@@ -1,3 +1,5 @@
+use std::mem;
+
 use serde::{Deserialize, Serialize, Serializer};
 
 /// Reserved system event for flag-exposure tracking. `feature_name` is required
@@ -60,35 +62,73 @@ pub struct IngestResponse {
 /// only maps flat scalar fields — a nested object field is left out of the
 /// pipe's field mapping and the column silently defaults to ''.
 #[derive(Debug, Clone, Serialize)]
-pub struct EventRecord<'a> {
-    pub environment_key: &'a str,
+pub struct EventRecord {
+    pub environment_key: String,
     pub collected_at: i64,
-    pub sdk_language: &'a str,
-    pub sdk_version: &'a str,
+    pub sdk_language: String,
+    pub sdk_version: String,
 
-    pub event: &'a str,
+    pub event: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub feature_name: Option<&'a str>,
+    pub feature_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<&'a str>,
+    pub identifier: Option<String>,
     #[serde(skip_serializing_if = "serde_json::Value::is_null")]
-    pub value: &'a serde_json::Value,
+    pub value: serde_json::Value,
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "json_string"
     )]
-    pub traits: Option<&'a serde_json::Value>,
+    pub traits: Option<serde_json::Value>,
     #[serde(
         skip_serializing_if = "Option::is_none",
         serialize_with = "json_string"
     )]
-    pub metadata: Option<&'a serde_json::Value>,
+    pub metadata: Option<serde_json::Value>,
     pub timestamp: i64,
+}
+
+impl EventRecord {
+    /// Approximate memory held, counted against a sink's buffer limit.
+    pub fn approx_size(&self) -> usize {
+        mem::size_of::<Self>()
+            + self.environment_key.len()
+            + self.sdk_language.len()
+            + self.sdk_version.len()
+            + self.event.len()
+            + self.feature_name.as_ref().map_or(0, String::len)
+            + self.identifier.as_ref().map_or(0, String::len)
+            + value_size(&self.value)
+            + self.traits.as_ref().map_or(0, value_size)
+            + self.metadata.as_ref().map_or(0, value_size)
+    }
+}
+
+/// Rough per-entry overhead of a JSON object's map.
+const MAP_ENTRY_OVERHEAD: usize = 32;
+
+/// Heap held by a JSON value; its inline size is counted by its parent.
+fn value_size(value: &serde_json::Value) -> usize {
+    use serde_json::Value;
+    match value {
+        Value::String(s) => s.len(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| mem::size_of::<Value>() + value_size(item))
+            .sum(),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, item)| {
+                MAP_ENTRY_OVERHEAD + key.len() + mem::size_of::<Value>() + value_size(item)
+            })
+            .sum(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    }
 }
 
 /// Serializes a JSON value as its encoded text, in a string.
 fn json_string<S: Serializer>(
-    value: &Option<&serde_json::Value>,
+    value: &Option<serde_json::Value>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     match value {

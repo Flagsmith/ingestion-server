@@ -177,12 +177,12 @@ fn validate_event(event: &Event, now: i64) -> Result<(), String> {
 /// Splits a batch into forwardable events and per-event rejections. Each
 /// event is validated independently: one invalid event never blocks its
 /// neighbours.
-fn partition_events(events: &[Event]) -> (Vec<&Event>, Vec<RejectedEvent>) {
+fn partition_events(events: Vec<Event>) -> (Vec<Event>, Vec<RejectedEvent>) {
     let now = Utc::now().timestamp_millis();
     let mut valid = Vec::with_capacity(events.len());
     let mut rejected = Vec::new();
-    for (i, event) in events.iter().enumerate() {
-        match validate_event(event, now) {
+    for (i, event) in events.into_iter().enumerate() {
+        match validate_event(&event, now) {
             Ok(()) => valid.push(event),
             Err(error) => rejected.push(RejectedEvent {
                 index: i,
@@ -216,12 +216,13 @@ pub async fn ingest_batch(
         return (StatusCode::BAD_REQUEST, Json(body)).into_response();
     }
 
-    let (valid, rejected) = partition_events(&batch.events);
+    let batch_size = batch.events.len();
+    let (valid, rejected) = partition_events(batch.events);
     if !rejected.is_empty() {
         warn!(
             client_api_key = %mask_key(&ctx.client_api_key),
             rejected_count = rejected.len(),
-            batch_size = batch.events.len(),
+            batch_size,
             first_error = %rejected[0].error,
             "Rejected invalid events from batch"
         );
@@ -244,24 +245,24 @@ pub async fn ingest_batch(
 
     // TODO: move this to a method.
     let records: Vec<EventRecord> = valid
-        .iter()
+        .into_iter()
         .map(|event| EventRecord {
-            environment_key: &ctx.client_api_key,
+            environment_key: ctx.client_api_key.to_string(),
             collected_at,
-            sdk_language: &sdk_language,
-            sdk_version: &sdk_version,
-            event: &event.event,
-            feature_name: event.feature_name.as_deref(),
-            identifier: event.identifier.as_deref(),
-            value: &event.value,
-            traits: event.traits.as_ref(),
-            metadata: event.metadata.as_ref(),
+            sdk_language: sdk_language.clone(),
+            sdk_version: sdk_version.clone(),
+            event: event.event,
+            feature_name: event.feature_name,
+            identifier: event.identifier,
+            value: event.value,
+            traits: event.traits,
+            metadata: event.metadata,
             timestamp: event.timestamp,
         })
         .collect();
 
     let record_count = records.len();
-    match sink.put(ctx.destination.as_deref(), &records).await {
+    match sink.put(ctx.destination.as_deref(), records).await {
         Ok(()) => {
             debug!(
                 client_api_key = %mask_key(&ctx.client_api_key),
@@ -318,7 +319,7 @@ mod tests {
     /// Partition the batch and return (accepted count, rejections).
     fn partition(json: &str) -> (usize, Vec<RejectedEvent>) {
         let batch = parse(json);
-        let (valid, rejected) = partition_events(&batch.events);
+        let (valid, rejected) = partition_events(batch.events);
         (valid.len(), rejected)
     }
 
@@ -545,18 +546,18 @@ mod tests {
         let batch = parse(
             r#"{"events":[{"event":"$flag_exposure","feature_name":"dark_mode","identifier":"user_1","value":"control","timestamp":1700000000000}]}"#,
         );
-        let event = &batch.events[0];
+        let event = batch.events.into_iter().next().unwrap();
         let record = EventRecord {
-            environment_key: "env_key",
+            environment_key: "env_key".to_string(),
             collected_at: 1700000000001,
-            sdk_language: "python",
-            sdk_version: "1.0.0",
-            event: &event.event,
-            feature_name: event.feature_name.as_deref(),
-            identifier: event.identifier.as_deref(),
-            value: &event.value,
-            traits: event.traits.as_ref(),
-            metadata: event.metadata.as_ref(),
+            sdk_language: "python".to_string(),
+            sdk_version: "1.0.0".to_string(),
+            event: event.event,
+            feature_name: event.feature_name,
+            identifier: event.identifier,
+            value: event.value,
+            traits: event.traits,
+            metadata: event.metadata,
             timestamp: event.timestamp,
         };
 

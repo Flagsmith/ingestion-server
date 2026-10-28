@@ -17,16 +17,9 @@ const MAX_RETRIES: u32 = 3;
 /// Doubles per retry: about 200 ms, 400 ms, 800 ms before jitter.
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 
-/// Writes one batch of owned rows to a store.
+/// Writes one batch of records to a store.
 pub trait BatchWriter: Send + Sync + 'static {
-    type Row: Send + Sync + 'static;
-
-    fn row(record: &EventRecord<'_>) -> Self::Row;
-
-    /// Approximate in-memory size, counted against the buffer limit.
-    fn row_size(row: &Self::Row) -> usize;
-
-    fn write(&self, rows: &[Self::Row]) -> impl Future<Output = Result<(), SinkError>> + Send;
+    fn write(&self, records: &[EventRecord]) -> impl Future<Output = Result<(), SinkError>> + Send;
 }
 
 #[derive(Debug, Clone)]
@@ -38,23 +31,23 @@ pub struct BatchConfig {
     pub max_bytes: usize,
 }
 
-struct Buffer<R> {
-    rows: Vec<R>,
-    /// Size of `rows` plus the batch being flushed.
+struct Buffer {
+    records: Vec<EventRecord>,
+    /// Size of `records` plus the batch being flushed.
     bytes: usize,
 }
 
 struct Shared<W: BatchWriter> {
     writer: W,
     config: BatchConfig,
-    buffer: Mutex<Buffer<W::Row>>,
+    buffer: Mutex<Buffer>,
     flush_now: Notify,
     stop: Notify,
 }
 
-/// Buffers rows in memory and writes them in batches from one background
-/// task. `put` returns once the rows are buffered, so rows still buffered are
-/// lost if the process dies.
+/// Buffers records in memory and writes them in batches from one background
+/// task. `put` returns once the records are buffered, so records still
+/// buffered are lost if the process dies.
 pub struct BatchingSink<W: BatchWriter> {
     shared: Arc<Shared<W>>,
     flusher: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -76,7 +69,7 @@ impl<W: BatchWriter> BatchingSink<W> {
             writer,
             config,
             buffer: Mutex::new(Buffer {
-                rows: Vec::new(),
+                records: Vec::new(),
                 bytes: 0,
             }),
             flush_now: Notify::new(),
@@ -90,17 +83,16 @@ impl<W: BatchWriter> BatchingSink<W> {
     }
 
     /// Buffer every record, or none of them if that would pass the byte limit.
-    pub fn put(&self, records: &[EventRecord<'_>]) -> Result<(), SinkError> {
-        let rows: Vec<W::Row> = records.iter().map(W::row).collect();
-        let bytes: usize = rows.iter().map(W::row_size).sum();
+    pub fn put(&self, records: Vec<EventRecord>) -> Result<(), SinkError> {
+        let bytes: usize = records.iter().map(EventRecord::approx_size).sum();
         let config = &self.shared.config;
         let mut buffer = self.shared.buffer.lock().expect("buffer lock");
         if buffer.bytes + bytes > config.max_bytes {
             return Err(SinkError::BufferFull);
         }
         buffer.bytes += bytes;
-        buffer.rows.extend(rows);
-        if buffer.rows.len() >= config.max_rows {
+        buffer.records.extend(records);
+        if buffer.records.len() >= config.max_rows {
             self.shared.flush_now.notify_one();
         }
         Ok(())
@@ -138,29 +130,29 @@ async fn run<W: BatchWriter>(shared: Arc<Shared<W>>) {
 }
 
 async fn flush<W: BatchWriter>(shared: &Shared<W>) {
-    let rows = mem::take(&mut shared.buffer.lock().expect("buffer lock").rows);
-    if rows.is_empty() {
+    let records = mem::take(&mut shared.buffer.lock().expect("buffer lock").records);
+    if records.is_empty() {
         return;
     }
-    for chunk in rows.chunks(shared.config.max_rows) {
+    for chunk in records.chunks(shared.config.max_rows) {
         write_with_retries(&shared.writer, chunk).await;
     }
-    let flushed: usize = rows.iter().map(W::row_size).sum();
+    let flushed: usize = records.iter().map(EventRecord::approx_size).sum();
     shared.buffer.lock().expect("buffer lock").bytes -= flushed;
 }
 
-async fn write_with_retries<W: BatchWriter>(writer: &W, rows: &[W::Row]) {
+async fn write_with_retries<W: BatchWriter>(writer: &W, records: &[EventRecord]) {
     let mut retry = 0;
     loop {
-        match writer.write(rows).await {
+        match writer.write(records).await {
             Ok(()) => return,
             Err(e) if retry < MAX_RETRIES => {
-                warn!(rows = rows.len(), retry, error = %e, "Sink batch write failed, retrying");
+                warn!(rows = records.len(), retry, error = %e, "Sink batch write failed, retrying");
                 tokio::time::sleep(backoff(retry)).await;
                 retry += 1;
             }
             Err(e) => {
-                error!(rows = rows.len(), error = %e, "Sink batch dropped after retries");
+                error!(rows = records.len(), error = %e, "Sink batch dropped after retries");
                 return;
             }
         }
@@ -180,9 +172,6 @@ mod tests {
 
     use super::*;
 
-    const ROW_SIZE: usize = 100;
-    static NULL: serde_json::Value = serde_json::Value::Null;
-
     /// Records every write attempt; fails all of them when `fail` is set.
     #[derive(Clone, Default)]
     struct FakeWriter {
@@ -192,43 +181,39 @@ mod tests {
     }
 
     impl BatchWriter for FakeWriter {
-        type Row = i64;
-
-        fn row(record: &EventRecord<'_>) -> i64 {
-            record.timestamp
-        }
-
-        fn row_size(_row: &i64) -> usize {
-            ROW_SIZE
-        }
-
-        async fn write(&self, rows: &[i64]) -> Result<(), SinkError> {
+        async fn write(&self, records: &[EventRecord]) -> Result<(), SinkError> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
             if self.fail {
                 return Err(SinkError::BufferFull);
             }
-            self.written.lock().unwrap().push(rows.to_vec());
+            let timestamps = records.iter().map(|record| record.timestamp).collect();
+            self.written.lock().unwrap().push(timestamps);
             Ok(())
         }
     }
 
-    fn records(timestamps: &[i64]) -> Vec<EventRecord<'static>> {
+    fn records(timestamps: &[i64]) -> Vec<EventRecord> {
         timestamps
             .iter()
             .map(|&timestamp| EventRecord {
-                environment_key: "env",
+                environment_key: "env".to_string(),
                 collected_at: timestamp,
-                sdk_language: "rust",
-                sdk_version: "1.0.0",
-                event: "purchase",
+                sdk_language: "rust".to_string(),
+                sdk_version: "1.0.0".to_string(),
+                event: "purchase".to_string(),
                 feature_name: None,
                 identifier: None,
-                value: &NULL,
+                value: serde_json::Value::Null,
                 traits: None,
                 metadata: None,
                 timestamp,
             })
             .collect()
+    }
+
+    /// Every test record has the same size.
+    fn record_size() -> usize {
+        records(&[0])[0].approx_size()
     }
 
     fn config(flush_interval: Duration, max_rows: usize, max_bytes: usize) -> BatchConfig {
@@ -244,7 +229,7 @@ mod tests {
         let writer = FakeWriter::default();
         let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(1), 100, 10_000));
 
-        sink.put(&records(&[1, 2])).unwrap();
+        sink.put(records(&[1, 2])).unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(writer.written.lock().unwrap().is_empty());
 
@@ -257,7 +242,7 @@ mod tests {
         let writer = FakeWriter::default();
         let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(3600), 2, 10_000));
 
-        sink.put(&records(&[1, 2])).unwrap();
+        sink.put(records(&[1, 2])).unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         assert_eq!(*writer.written.lock().unwrap(), vec![vec![1, 2]]);
@@ -268,15 +253,15 @@ mod tests {
         let writer = FakeWriter::default();
         let sink = BatchingSink::new(
             writer.clone(),
-            config(Duration::from_secs(3600), 100, 2 * ROW_SIZE),
+            config(Duration::from_secs(3600), 100, 2 * record_size()),
         );
 
-        sink.put(&records(&[1])).unwrap();
+        sink.put(records(&[1])).unwrap();
         assert!(matches!(
-            sink.put(&records(&[2, 3])),
+            sink.put(records(&[2, 3])),
             Err(SinkError::BufferFull)
         ));
-        sink.put(&records(&[4])).unwrap();
+        sink.put(records(&[4])).unwrap();
 
         sink.shutdown(Duration::from_secs(1)).await;
         assert_eq!(*writer.written.lock().unwrap(), vec![vec![1, 4]]);
@@ -290,17 +275,17 @@ mod tests {
         };
         let sink = BatchingSink::new(
             writer.clone(),
-            config(Duration::from_secs(1), 100, ROW_SIZE),
+            config(Duration::from_secs(1), 100, record_size()),
         );
 
-        sink.put(&records(&[1])).unwrap();
+        sink.put(records(&[1])).unwrap();
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         assert_eq!(
             writer.attempts.load(Ordering::SeqCst),
             1 + MAX_RETRIES as usize
         );
-        sink.put(&records(&[2])).unwrap();
+        sink.put(records(&[2])).unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -311,7 +296,7 @@ mod tests {
             config(Duration::from_secs(3600), 100, 10_000),
         );
 
-        sink.put(&records(&[1, 2, 3])).unwrap();
+        sink.put(records(&[1, 2, 3])).unwrap();
         sink.shutdown(Duration::from_secs(1)).await;
 
         assert_eq!(*writer.written.lock().unwrap(), vec![vec![1, 2, 3]]);
