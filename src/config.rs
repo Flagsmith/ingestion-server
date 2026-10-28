@@ -24,7 +24,9 @@ pub struct KafkaConfig {
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let sink = parse_sink(&env::var("SINK").unwrap_or_else(|_| "kafka".to_string()))?;
+        let sink = match parse_sink(env::var("SINK").ok().as_deref())? {
+            SinkKind::Kafka => SinkConfig::Kafka(KafkaConfig::from_env()?),
+        };
 
         Ok(Config {
             listen_addr: env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
@@ -55,9 +57,15 @@ fn required(name: &'static str) -> Result<String, ConfigError> {
     env::var(name).map_err(|_| ConfigError::MissingRequired(name))
 }
 
-fn parse_sink(name: &str) -> Result<SinkConfig, ConfigError> {
-    match name {
-        "kafka" => Ok(SinkConfig::Kafka(KafkaConfig::from_env()?)),
+#[derive(Debug, PartialEq)]
+enum SinkKind {
+    Kafka,
+}
+
+/// Which sink `SINK` selects; unset means Kafka.
+fn parse_sink(value: Option<&str>) -> Result<SinkKind, ConfigError> {
+    match value.unwrap_or("kafka") {
+        "kafka" => Ok(SinkKind::Kafka),
         other => Err(ConfigError::InvalidSink(other.to_string())),
     }
 }
@@ -129,9 +137,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_sink_defaults_to_kafka() {
+        assert_eq!(parse_sink(None).unwrap(), SinkKind::Kafka);
+        assert_eq!(parse_sink(Some("kafka")).unwrap(), SinkKind::Kafka);
+    }
+
+    #[test]
     fn parse_sink_rejects_unknown_value() {
         assert!(matches!(
-            parse_sink("clickhouse"),
+            parse_sink(Some("clickhouse")),
             Err(ConfigError::InvalidSink(v)) if v == "clickhouse"
         ));
     }

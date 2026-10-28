@@ -237,8 +237,8 @@ pub async fn ingest_batch(
             feature_name: event.feature_name.as_deref(),
             identifier: event.identifier.as_deref(),
             value: &event.value,
-            traits: event.traits.as_ref().map(ToString::to_string),
-            metadata: event.metadata.as_ref().map(ToString::to_string),
+            traits: event.traits.as_ref(),
+            metadata: event.metadata.as_ref(),
             timestamp: event.timestamp,
         })
         .collect();
@@ -512,8 +512,8 @@ mod tests {
             feature_name: event.feature_name.as_deref(),
             identifier: event.identifier.as_deref(),
             value: &event.value,
-            traits: event.traits.as_ref().map(ToString::to_string),
-            metadata: event.metadata.as_ref().map(ToString::to_string),
+            traits: event.traits.as_ref(),
+            metadata: event.metadata.as_ref(),
             timestamp: event.timestamp,
         };
 
