@@ -5,7 +5,7 @@ mod kafka;
 use std::time::Duration;
 
 pub use batching::{BatchConfig, BatchingSink};
-pub use clickhouse::{ClickHouseSinkConfig, ClickHouseWriter};
+pub use clickhouse::{ClickHouseConfig, ClickHouseWriter};
 pub use kafka::{KafkaAuth, KafkaSink, KafkaSinkConfig};
 
 use crate::models::EventRecord;

@@ -13,7 +13,7 @@ use crate::models::EventRecord;
 const INSERT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
-pub struct ClickHouseSinkConfig {
+pub struct ClickHouseConfig {
     pub url: String,
     pub user: String,
     pub password: String,
@@ -22,9 +22,9 @@ pub struct ClickHouseSinkConfig {
 }
 
 /// Keeps the password out of logs.
-impl fmt::Debug for ClickHouseSinkConfig {
+impl fmt::Debug for ClickHouseConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ClickHouseSinkConfig")
+        f.debug_struct("ClickHouseConfig")
             .field("url", &self.url)
             .field("user", &self.user)
             .field("database", &self.database)
@@ -92,7 +92,7 @@ pub struct ClickHouseWriter {
 
 impl ClickHouseWriter {
     /// Connects lazily, on the first insert.
-    pub fn new(config: ClickHouseSinkConfig) -> Self {
+    pub fn new(config: ClickHouseConfig) -> Self {
         let client = Client::default()
             .with_url(config.url)
             .with_user(config.user)
@@ -185,7 +185,7 @@ mod tests {
 
     #[test]
     fn debug_output_omits_the_password() {
-        let config = ClickHouseSinkConfig {
+        let config = ClickHouseConfig {
             url: "https://clickhouse:8443".to_string(),
             user: "ingest".to_string(),
             password: "hunter2".to_string(),

@@ -11,7 +11,7 @@ use rdkafka::producer::DefaultProducerContext;
 use rdkafka::Message;
 use sqlx::PgPool;
 
-use crate::sink::{ClickHouseSinkConfig, KafkaAuth, KafkaSink, KafkaSinkConfig, Sink};
+use crate::sink::{ClickHouseConfig, KafkaAuth, KafkaSink, KafkaSinkConfig, Sink};
 
 pub(crate) const FLAGSMITH_WAREHOUSE_TOPIC: &str = "events-default";
 
@@ -148,7 +148,7 @@ static NEXT_DATABASE: AtomicUsize = AtomicUsize::new(0);
 /// `CLICKHOUSE_URL` (with `CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD`, as the
 /// server reads them). Call `drop` at the end of the test.
 pub(crate) struct ClickHouseTestDatabase {
-    pub(crate) config: ClickHouseSinkConfig,
+    pub(crate) config: ClickHouseConfig,
     pub(crate) client: Client,
 }
 
@@ -178,7 +178,7 @@ impl ClickHouseTestDatabase {
             .expect("create events table");
         Self {
             client: server.with_database(&database),
-            config: ClickHouseSinkConfig {
+            config: ClickHouseConfig {
                 url,
                 user,
                 password,

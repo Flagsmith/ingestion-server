@@ -305,7 +305,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::sink::{
-        BatchConfig, BatchingSink, ClickHouseSinkConfig, ClickHouseWriter, KafkaAuth, KafkaSink,
+        BatchConfig, BatchingSink, ClickHouseConfig, ClickHouseWriter, KafkaAuth, KafkaSink,
         KafkaSinkConfig,
     };
     use crate::test_helpers::{
@@ -730,7 +730,7 @@ mod tests {
         // Room for one buffered event; the unreachable server and the hour-long
         // interval keep it buffered.
         let sink = Sink::ClickHouse(BatchingSink::new(
-            ClickHouseWriter::new(ClickHouseSinkConfig {
+            ClickHouseWriter::new(ClickHouseConfig {
                 url: "http://127.0.0.1:1".to_string(),
                 user: "default".to_string(),
                 password: String::new(),

@@ -2,7 +2,7 @@ use std::env;
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::sink::{BatchConfig, ClickHouseSinkConfig, KafkaAuth};
+use crate::sink::{BatchConfig, ClickHouseConfig, KafkaAuth};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -15,7 +15,7 @@ pub struct Config {
 pub enum SinkConfig {
     Kafka(KafkaConfig),
     ClickHouse {
-        clickhouse: ClickHouseSinkConfig,
+        clickhouse: ClickHouseConfig,
         batch: BatchConfig,
     },
 }
@@ -82,8 +82,8 @@ fn parse_sink(value: Option<&str>) -> Result<SinkKind, ConfigError> {
     }
 }
 
-fn clickhouse_from_env() -> Result<ClickHouseSinkConfig, ConfigError> {
-    Ok(ClickHouseSinkConfig {
+fn clickhouse_from_env() -> Result<ClickHouseConfig, ConfigError> {
+    Ok(ClickHouseConfig {
         url: required("CLICKHOUSE_URL")?,
         user: env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string()),
         password: env::var("CLICKHOUSE_PASSWORD").unwrap_or_default(),
