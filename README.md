@@ -52,7 +52,7 @@ On the wire to Kafka, `traits` and `metadata` are produced as JSON-encoded strin
 
 | Env var | Required | Default |
 |---|---|---|
-| `SINK` | no | `kafka` (or `clickhouse`) |
+| `SINK` | no | `kafka` (or `clickhouse`, `postgres`) |
 | `KAFKA_BOOTSTRAP_SERVERS` | with `kafka` | — |
 | `KAFKA_TOPIC` | with `kafka` | — |
 | `KAFKA_EXTERNAL_TOPIC` | with `kafka` | — |
@@ -69,7 +69,7 @@ On the wire to Kafka, `traits` and `metadata` are produced as JSON-encoded strin
 | `DATABASE_URL` | yes | — |
 | `LISTEN_ADDR` | no | `0.0.0.0:8080` |
 
-With `SINK=kafka`, events from environments that use an external warehouse go to `KAFKA_EXTERNAL_TOPIC`; all others go to `KAFKA_TOPIC`. With `SINK=clickhouse`, every event goes to the one ClickHouse table. The server looks presented keys up in the `experimentation_environment_keys` view in Flagsmith's Postgres, at `DATABASE_URL`.
+With `SINK=kafka`, events from environments that use an external warehouse go to `KAFKA_EXTERNAL_TOPIC`; all others go to `KAFKA_TOPIC`. With `SINK=clickhouse`, every event goes to the one ClickHouse table, and with `SINK=postgres`, to `flagsmith_exp.events` at `DATABASE_URL`. The server looks presented keys up in the `experimentation_environment_keys` view in Flagsmith's Postgres, at `DATABASE_URL`.
 
 ### Database role
 
@@ -89,6 +89,15 @@ With `KAFKA_AUTH=scram`, the producer authenticates with SASL/SCRAM-SHA-512 over
 ### ClickHouse sink
 
 With `SINK=clickhouse`, `202` means the events are buffered in memory, not yet stored. A background task takes the whole buffer every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_FLUSH_MAX_EVENTS` events are waiting, and writes it as one `INSERT`. A failed batch is retried 3 times and then dropped with an error log. The buffer is unbounded: requests never wait or get `503`, so while a write is slow or failing (up to about 2 minutes with retries) it grows by the ingest rate times the write time, and the next flush takes it all. A normal shutdown (SIGTERM) flushes the buffer, but events still buffered are lost if the process crashes.
+
+### PostgreSQL sink
+
+With `SINK=postgres`, events are buffered and flushed as with the ClickHouse sink, and each batch is written to `flagsmith_exp.events` in Flagsmith's Postgres, at `DATABASE_URL`, as one `INSERT` in a transaction. Flagsmith's migrations create the table. The sink shares the server's connection pool. If the server's role does not own the table, grant it:
+
+```sql
+GRANT USAGE ON SCHEMA flagsmith_exp TO ingestion_server;
+GRANT INSERT ON flagsmith_exp.events TO ingestion_server;
+```
 
 ## Run locally
 

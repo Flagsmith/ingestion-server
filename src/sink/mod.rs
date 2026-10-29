@@ -1,12 +1,14 @@
 mod batching;
 mod clickhouse;
 mod kafka;
+mod postgres;
 
 use std::time::Duration;
 
 pub use batching::{BatchConfig, BatchingSink};
 pub use clickhouse::{ClickHouseConfig, ClickHouseWriter};
 pub use kafka::{KafkaAuth, KafkaSink, KafkaSinkConfig};
+pub use postgres::PostgresWriter;
 
 use crate::models::EventRecord;
 
@@ -15,6 +17,7 @@ use crate::models::EventRecord;
 pub enum Sink {
     Kafka(KafkaSink),
     ClickHouse(BatchingSink<ClickHouseWriter>),
+    Postgres(BatchingSink<PostgresWriter>),
 }
 
 impl Sink {
@@ -32,6 +35,10 @@ impl Sink {
                 sink.put(records);
                 Ok(())
             }
+            Self::Postgres(sink) => {
+                sink.put(records);
+                Ok(())
+            }
         }
     }
 
@@ -39,7 +46,7 @@ impl Sink {
     pub fn fatal_error(&self) -> Option<String> {
         match self {
             Self::Kafka(sink) => sink.fatal_error(),
-            Self::ClickHouse(_) => None,
+            Self::ClickHouse(_) | Self::Postgres(_) => None,
         }
     }
 
@@ -48,6 +55,7 @@ impl Sink {
         match self {
             Self::Kafka(sink) => sink.shutdown(timeout).await,
             Self::ClickHouse(sink) => sink.shutdown(timeout).await,
+            Self::Postgres(sink) => sink.shutdown(timeout).await,
         }
     }
 }
@@ -58,4 +66,8 @@ pub enum SinkError {
     Kafka(#[from] kafka::DeliveryError),
     #[error("ClickHouse insert failed: {0}")]
     ClickHouse(#[from] ::clickhouse::error::Error),
+    #[error("PostgreSQL insert failed: {0}")]
+    Postgres(#[from] sqlx::Error),
+    #[error("PostgreSQL insert timed out")]
+    PostgresTimeout,
 }
