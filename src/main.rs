@@ -18,7 +18,7 @@ use tracing::info;
 use auth::ContextState;
 use config::{Config, SinkConfig};
 use environment_keys::EnvironmentKeys;
-use sink::{BatchingSink, ClickHouseWriter, KafkaSink, KafkaSinkConfig, Sink};
+use sink::{BatchingSink, ClickHouseWriter, KafkaSink, KafkaSinkConfig, PostgresWriter, Sink};
 
 const ENVIRONMENT_KEY_REFRESH_AFTER: Duration = Duration::from_secs(300);
 
@@ -33,6 +33,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .acquire_timeout(Duration::from_secs(1))
+        .connect_lazy(&config.database_url)?;
     let (sink, external_topic) = match &config.sink {
         SinkConfig::Kafka(kafka) => {
             info!(
@@ -62,12 +66,21 @@ async fn main() -> anyhow::Result<()> {
                 None,
             )
         }
+        SinkConfig::Postgres { batch } => {
+            info!(
+                listen_addr = %config.listen_addr,
+                sink = "postgres",
+                batch = ?batch,
+                "Starting flagsmith-analytics server"
+            );
+            let writer = PostgresWriter::new(pool.clone());
+            (
+                Sink::Postgres(BatchingSink::new(writer, batch.clone())),
+                None,
+            )
+        }
     };
 
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .acquire_timeout(Duration::from_secs(1))
-        .connect_lazy(&config.database_url)?;
     let context_state = ContextState {
         environment_keys: EnvironmentKeys::new(pool, ENVIRONMENT_KEY_REFRESH_AFTER),
         external_topic: external_topic.map(Arc::from),

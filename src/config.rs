@@ -18,6 +18,9 @@ pub enum SinkConfig {
         clickhouse: ClickHouseConfig,
         batch: BatchConfig,
     },
+    Postgres {
+        batch: BatchConfig,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +37,9 @@ impl Config {
             SinkKind::Kafka => SinkConfig::Kafka(KafkaConfig::from_env()?),
             SinkKind::ClickHouse => SinkConfig::ClickHouse {
                 clickhouse: clickhouse_config_from_env()?,
+                batch: batch_config_from_env()?,
+            },
+            SinkKind::Postgres => SinkConfig::Postgres {
                 batch: batch_config_from_env()?,
             },
         };
@@ -71,6 +77,7 @@ fn required(name: &'static str) -> Result<String, ConfigError> {
 enum SinkKind {
     Kafka,
     ClickHouse,
+    Postgres,
 }
 
 /// Which sink `SINK` selects; unset means Kafka.
@@ -78,6 +85,7 @@ fn parse_sink(value: Option<&str>) -> Result<SinkKind, ConfigError> {
     match value.unwrap_or("kafka") {
         "kafka" => Ok(SinkKind::Kafka),
         "clickhouse" => Ok(SinkKind::ClickHouse),
+        "postgres" => Ok(SinkKind::Postgres),
         other => Err(ConfigError::InvalidSink(other.to_string())),
     }
 }
@@ -134,7 +142,7 @@ pub enum ConfigError {
     MissingRequired(&'static str),
     #[error("Invalid value for {0}: {1:?} (expected scram or none)")]
     Invalid(&'static str, String),
-    #[error("Invalid value for SINK: {0:?} (expected kafka or clickhouse)")]
+    #[error("Invalid value for SINK: {0:?} (expected kafka, clickhouse or postgres)")]
     InvalidSink(String),
     #[error("Invalid value for {0}: {1:?} (expected a positive integer)")]
     InvalidNumber(&'static str, String),
@@ -189,13 +197,14 @@ mod tests {
             parse_sink(Some("clickhouse")).unwrap(),
             SinkKind::ClickHouse
         );
+        assert_eq!(parse_sink(Some("postgres")).unwrap(), SinkKind::Postgres);
     }
 
     #[test]
     fn parse_sink_rejects_unknown_value() {
         assert!(matches!(
-            parse_sink(Some("postgres")),
-            Err(ConfigError::InvalidSink(v)) if v == "postgres"
+            parse_sink(Some("bigquery")),
+            Err(ConfigError::InvalidSink(v)) if v == "bigquery"
         ));
     }
 
