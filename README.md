@@ -8,7 +8,7 @@ Rust + axum, deployed as an ARM64 container on ECS Fargate.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/health` | Liveness probe → `{"status":"healthy"}`. Touches no downstream; returns `503` once the Kafka producer has hit a fatal error, so ECS replaces the task. |
+| GET | `/health` | Liveness probe → `{"status":"healthy"}`. Touches no downstream; returns `503` once the sink has hit a fatal error (the Kafka producer's, or a ClickHouse config error), so ECS replaces the task. |
 | POST | `/v1/events` | Ingest an event batch. Requires the `X-Environment-Key` header. |
 
 `POST /v1/events` validates each event independently — invalid events are rejected individually and never block valid ones in the same batch.
@@ -42,7 +42,7 @@ An empty `events` array adds a top-level `error` field: `{ "accepted": 0, "rejec
 }
 ```
 
-`event` and `timestamp` (epoch millis) are required. `$flag_exposure` is a reserved system event and requires `feature_name` (omitting it rejects that event); `identifier`, `value`, `traits`, and `metadata` are optional.
+`event` and `timestamp` (epoch millis) are required; `timestamp` must be after 2020-01-01, no more than 24h in the future and no more than 10 days in the past (otherwise that event is rejected). `$flag_exposure` is a reserved system event and requires `feature_name` (omitting it rejects that event); `identifier`, `value`, `traits`, and `metadata` are optional.
 
 Field limits — an over-limit field rejects that event: `event` ≤ 256 chars; `feature_name` and `identifier` ≤ 2000 chars, trait keys ≤ 200 chars, trait string values ≤ 2000 chars (all matching Flagsmith's model limits); serialized `value` ≤ 128 KiB (fits Flagsmith's default 20,000-char flag value limit), `traits` ≤ 32 KiB, `metadata` ≤ 8 KiB. `traits` must be a JSON object.
 
@@ -52,17 +52,24 @@ On the wire to Kafka, `traits` and `metadata` are produced as JSON-encoded strin
 
 | Env var | Required | Default |
 |---|---|---|
-| `SINK` | no | `kafka` (the only sink so far) |
-| `KAFKA_BOOTSTRAP_SERVERS` | yes | — |
-| `KAFKA_TOPIC` | yes | — |
-| `KAFKA_EXTERNAL_TOPIC` | yes | — |
+| `SINK` | no | `kafka` (or `clickhouse`) |
+| `KAFKA_BOOTSTRAP_SERVERS` | with `kafka` | — |
+| `KAFKA_TOPIC` | with `kafka` | — |
+| `KAFKA_EXTERNAL_TOPIC` | with `kafka` | — |
 | `KAFKA_AUTH` | no | `scram` (`none` for plaintext local brokers) |
 | `KAFKA_USERNAME` | with `scram` | — |
 | `KAFKA_PASSWORD` | with `scram` | — |
+| `CLICKHOUSE_URL` | with `clickhouse` | — |
+| `CLICKHOUSE_USER` | no | `default` |
+| `CLICKHOUSE_PASSWORD` | no | empty |
+| `CLICKHOUSE_DATABASE` | no | `flagsmith_exp` |
+| `CLICKHOUSE_TABLE` | no | `events` |
+| `SINK_FLUSH_INTERVAL_MS` | no | `1000` |
+| `SINK_FLUSH_MAX_EVENTS` | no | `5000` |
 | `DATABASE_URL` | yes | — |
 | `LISTEN_ADDR` | no | `0.0.0.0:8080` |
 
-Events from environments that use an external warehouse go to `KAFKA_EXTERNAL_TOPIC`; all others go to `KAFKA_TOPIC`. The server looks presented keys up in the `experimentation_environment_keys` view in Flagsmith's Postgres, at `DATABASE_URL`.
+With `SINK=kafka`, events from environments that use an external warehouse go to `KAFKA_EXTERNAL_TOPIC`; all others go to `KAFKA_TOPIC`. With `SINK=clickhouse`, every event goes to the one ClickHouse table. The server looks presented keys up in the `experimentation_environment_keys` view in Flagsmith's Postgres, at `DATABASE_URL`.
 
 ### Database role
 
@@ -79,6 +86,10 @@ The view reads its tables with its owner's privileges, so the role needs no acce
 
 With `KAFKA_AUTH=scram`, the producer authenticates with SASL/SCRAM-SHA-512 over TLS; MSK serves it on port 9096. The task definition injects both credentials from the `AmazonMSK_*` secret in Secrets Manager.
 
+### ClickHouse sink
+
+With `SINK=clickhouse`, `202` means the events are buffered in memory, not yet stored. A background task takes the whole buffer every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_FLUSH_MAX_EVENTS` events are waiting, and writes it as one `INSERT`. A batch that fails with a transient error (network, timeout, overload, or anything unrecognised) is retried 5 times over about 17 seconds, enough to ride out a ClickHouse restart, and then dropped with an error log; these never affect `/health`. Rows the table rejects (parse, type or constraint errors) drop the batch at once, with an error log, and leave `/health` alone. A config error (bad credentials or grants, or a missing database, table or column) drops the batch at once and fails `/health` until restart. At startup the server checks that ClickHouse is reachable, accepts the credentials, and has a table whose columns match, and exits with an error if not. The buffer is unbounded: requests never wait or get `503`, so while a write is slow or failing (up to about 3 minutes with retries) it grows by the ingest rate times the write time, and the next flush takes it all. A normal shutdown (SIGTERM) flushes the buffer, but events still buffered are lost if the process crashes.
+
 ## Run locally
 
 ```bash
@@ -90,7 +101,7 @@ curl localhost:8080/health
 
 The Kafka producer and Postgres pool connect lazily, so `/health` responds even without either available.
 
-`cargo test` needs a Postgres it can create databases in, at `DATABASE_URL`: each database test gets a fresh one.
+`cargo test` needs a Postgres it can create databases in, at `DATABASE_URL`, and a ClickHouse it can create databases in, at `CLICKHOUSE_URL` (with `CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD` if needed): each database test gets a fresh one.
 
 ## CI / CD
 

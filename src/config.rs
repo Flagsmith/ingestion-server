@@ -1,6 +1,8 @@
 use std::env;
+use std::str::FromStr;
+use std::time::Duration;
 
-use crate::sink::KafkaAuth;
+use crate::sink::{BatchConfig, ClickHouseConfig, KafkaAuth};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -12,6 +14,10 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub enum SinkConfig {
     Kafka(KafkaConfig),
+    ClickHouse {
+        clickhouse: ClickHouseConfig,
+        batch: BatchConfig,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +32,10 @@ impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let sink = match parse_sink(env::var("SINK").ok().as_deref())? {
             SinkKind::Kafka => SinkConfig::Kafka(KafkaConfig::from_env()?),
+            SinkKind::ClickHouse => SinkConfig::ClickHouse {
+                clickhouse: clickhouse_config_from_env()?,
+                batch: batch_config_from_env()?,
+            },
         };
 
         Ok(Config {
@@ -60,13 +70,46 @@ fn required(name: &'static str) -> Result<String, ConfigError> {
 #[derive(Debug, PartialEq)]
 enum SinkKind {
     Kafka,
+    ClickHouse,
 }
 
 /// Which sink `SINK` selects; unset means Kafka.
 fn parse_sink(value: Option<&str>) -> Result<SinkKind, ConfigError> {
     match value.unwrap_or("kafka") {
         "kafka" => Ok(SinkKind::Kafka),
+        "clickhouse" => Ok(SinkKind::ClickHouse),
         other => Err(ConfigError::InvalidSink(other.to_string())),
+    }
+}
+
+fn clickhouse_config_from_env() -> Result<ClickHouseConfig, ConfigError> {
+    Ok(ClickHouseConfig {
+        url: required("CLICKHOUSE_URL")?,
+        user: env::var("CLICKHOUSE_USER").unwrap_or_else(|_| "default".to_string()),
+        password: env::var("CLICKHOUSE_PASSWORD").unwrap_or_default(),
+        database: env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "flagsmith_exp".to_string()),
+        table: env::var("CLICKHOUSE_TABLE").unwrap_or_else(|_| "events".to_string()),
+    })
+}
+
+/// Shared by every batching sink.
+fn batch_config_from_env() -> Result<BatchConfig, ConfigError> {
+    Ok(BatchConfig {
+        flush_interval: Duration::from_millis(positive_env_var("SINK_FLUSH_INTERVAL_MS", 1000)?),
+        flush_max_events: positive_env_var("SINK_FLUSH_MAX_EVENTS", 5000)?,
+    })
+}
+
+fn positive_env_var<T: FromStr + Default + PartialOrd>(
+    name: &'static str,
+    default: T,
+) -> Result<T, ConfigError> {
+    match env::var(name).ok() {
+        None => Ok(default),
+        Some(v) => match v.parse() {
+            Ok(n) if n > T::default() => Ok(n),
+            _ => Err(ConfigError::InvalidNumber(name, v)),
+        },
     }
 }
 
@@ -91,8 +134,10 @@ pub enum ConfigError {
     MissingRequired(&'static str),
     #[error("Invalid value for {0}: {1:?} (expected scram or none)")]
     Invalid(&'static str, String),
-    #[error("Invalid value for SINK: {0:?} (expected kafka)")]
+    #[error("Invalid value for SINK: {0:?} (expected kafka or clickhouse)")]
     InvalidSink(String),
+    #[error("Invalid value for {0}: {1:?} (expected a positive integer)")]
+    InvalidNumber(&'static str, String),
 }
 
 #[cfg(test)]
@@ -140,13 +185,49 @@ mod tests {
     fn parse_sink_defaults_to_kafka() {
         assert_eq!(parse_sink(None).unwrap(), SinkKind::Kafka);
         assert_eq!(parse_sink(Some("kafka")).unwrap(), SinkKind::Kafka);
+        assert_eq!(
+            parse_sink(Some("clickhouse")).unwrap(),
+            SinkKind::ClickHouse
+        );
     }
 
     #[test]
     fn parse_sink_rejects_unknown_value() {
         assert!(matches!(
-            parse_sink(Some("clickhouse")),
-            Err(ConfigError::InvalidSink(v)) if v == "clickhouse"
+            parse_sink(Some("postgres")),
+            Err(ConfigError::InvalidSink(v)) if v == "postgres"
         ));
+    }
+
+    // Each test uses its own variable, since the environment is shared
+    // across test threads.
+
+    #[test]
+    fn test_positive_env_var_defaults_when_unset() {
+        assert_eq!(
+            positive_env_var("TEST_POSITIVE_ENV_VAR_UNSET", 1000u64).unwrap(),
+            1000
+        );
+    }
+
+    #[test]
+    fn test_positive_env_var_reads_a_positive_integer() {
+        env::set_var("TEST_POSITIVE_ENV_VAR_SET", "50");
+        assert_eq!(
+            positive_env_var("TEST_POSITIVE_ENV_VAR_SET", 1000usize).unwrap(),
+            50
+        );
+    }
+
+    #[test]
+    fn test_positive_env_var_rejects_zero_and_non_numbers() {
+        const NAME: &str = "TEST_POSITIVE_ENV_VAR_INVALID";
+        for value in ["0", "-1", "ten", ""] {
+            env::set_var(NAME, value);
+            assert!(matches!(
+                positive_env_var(NAME, 1000u64),
+                Err(ConfigError::InvalidNumber(NAME, v)) if v == value
+            ));
+        }
     }
 }

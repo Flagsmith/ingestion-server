@@ -44,7 +44,7 @@ mod tests {
     use super::*;
     use crate::environment_keys::EnvironmentKeys;
     use crate::test_helpers::{
-        assert_topic_empty, create_environment_keys, insert_environment_key, mock_kafka,
+        assert_topic_empty, create_environment_keys, insert_environment_key, mock_kafka, now_ms,
         read_records, FLAGSMITH_WAREHOUSE_TOPIC,
     };
 
@@ -53,7 +53,7 @@ mod tests {
     fn context_state(pool: PgPool) -> ContextState {
         ContextState {
             environment_keys: EnvironmentKeys::new(pool, Duration::from_secs(300)),
-            external_topic: Arc::from(EXTERNAL_WAREHOUSE_TOPIC),
+            external_topic: Some(Arc::from(EXTERNAL_WAREHOUSE_TOPIC)),
         }
     }
 
@@ -63,9 +63,10 @@ mod tests {
             .uri("/v1/events")
             .header("content-type", "application/json")
             .header("X-Environment-Key", key)
-            .body(Body::from(
-                r#"{"events":[{"event":"purchase","value":42,"timestamp":1700000000000}]}"#,
-            ))
+            .body(Body::from(format!(
+                r#"{{"events":[{{"event":"purchase","value":42,"timestamp":{}}}]}}"#,
+                now_ms()
+            )))
             .unwrap()
     }
 

@@ -148,7 +148,7 @@ impl KafkaSink {
     pub async fn put(
         &self,
         destination: Option<&str>,
-        records: &[EventRecord<'_>],
+        records: &[EventRecord],
     ) -> Result<(), DeliveryError> {
         let topic = destination.unwrap_or(&self.default_topic);
         let total = records.len();
