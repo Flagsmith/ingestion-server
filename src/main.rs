@@ -11,6 +11,7 @@ mod test_helpers;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use sqlx::postgres::PgPoolOptions;
 use tokio::signal;
 use tracing::info;
@@ -57,6 +58,10 @@ async fn main() -> anyhow::Result<()> {
                 "Starting flagsmith-analytics server"
             );
             let writer = ClickHouseWriter::new(clickhouse.clone());
+            writer
+                .check()
+                .await
+                .context("ClickHouse startup check failed")?;
             (
                 Sink::ClickHouse(BatchingSink::new(writer, batch.clone())),
                 None,

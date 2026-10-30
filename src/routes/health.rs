@@ -10,7 +10,7 @@ pub struct HealthResponse {
     error: Option<String>,
 }
 
-/// Liveness plus one local check: a fatal producer error is permanent, so
+/// Liveness plus one local check: a fatal sink error is permanent, so
 /// report it and let ECS replace the task. No downstream call, so this cannot hang.
 pub async fn health_check(State(sink): State<Sink>) -> (StatusCode, Json<HealthResponse>) {
     match sink.fatal_error() {

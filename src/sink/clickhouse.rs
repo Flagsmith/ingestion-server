@@ -2,15 +2,37 @@ use std::borrow::Cow;
 use std::fmt;
 use std::time::Duration;
 
+use clickhouse::error::Error;
 use clickhouse::{Client, Compression, Row};
 use serde::Serialize;
 
 use super::batching::BatchWriter;
-use super::SinkError;
+use super::{ErrorKind, SinkError};
 use crate::models::EventRecord;
 
 /// Bounds sending and committing one batch of up to `SINK_FLUSH_MAX_EVENTS` rows.
 const INSERT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Server error codes for rows the table rejects.
+const BAD_DATA_ERROR_CODES: [u32; 5] = [
+    6,   // CANNOT_PARSE_TEXT
+    27,  // CANNOT_PARSE_INPUT_ASSERTION_FAILED
+    53,  // TYPE_MISMATCH
+    117, // INCORRECT_DATA
+    469, // VIOLATED_CONSTRAINT
+];
+
+/// Server error codes for bad credentials or grants, or a missing database,
+/// table or column.
+const CONFIG_ERROR_CODES: [u32; 7] = [
+    16,  // NO_SUCH_COLUMN_IN_TABLE
+    60,  // UNKNOWN_TABLE
+    81,  // UNKNOWN_DATABASE
+    192, // UNKNOWN_USER
+    194, // REQUIRED_PASSWORD
+    497, // ACCESS_DENIED
+    516, // AUTHENTICATION_FAILED
+];
 
 #[derive(Clone)]
 pub struct ClickHouseConfig {
@@ -85,6 +107,29 @@ fn value_to_text(value: &serde_json::Value) -> Cow<'_, str> {
     }
 }
 
+/// Anything unrecognised, such as a network error, timeout or overloaded
+/// server, counts as transient.
+pub(super) fn error_kind(error: &Error) -> ErrorKind {
+    match error {
+        // A row that fails to serialize.
+        Error::Custom(_) => ErrorKind::BadData,
+        // `ClickHouseRow` doesn't match the table.
+        Error::SchemaMismatch(_) => ErrorKind::Config,
+        Error::BadResponse(reason) => match error_code(reason) {
+            Some(code) if BAD_DATA_ERROR_CODES.contains(&code) => ErrorKind::BadData,
+            Some(code) if CONFIG_ERROR_CODES.contains(&code) => ErrorKind::Config,
+            _ => ErrorKind::Transient,
+        },
+        _ => ErrorKind::Transient,
+    }
+}
+
+/// The code of a server exception, e.g. 60 in "Code: 60. DB::Exception: ...".
+fn error_code(reason: &str) -> Option<u32> {
+    let rest = reason.strip_prefix("Code: ")?;
+    rest[..rest.find('.')?].parse().ok()
+}
+
 pub struct ClickHouseWriter {
     client: Client,
     table: String,
@@ -103,6 +148,16 @@ impl ClickHouseWriter {
             client,
             table: config.table,
         }
+    }
+
+    /// Fails if ClickHouse is unreachable, rejects the credentials, or the
+    /// table's columns don't match `ClickHouseRow`. Column types are only
+    /// checked on the first write.
+    pub async fn check(&self) -> Result<(), SinkError> {
+        // Opening an insert fetches the table's schema and matches it against
+        // the row; dropping it unused sends nothing.
+        let _ = self.client.insert::<ClickHouseRow<'_>>(&self.table).await?;
+        Ok(())
     }
 }
 
@@ -194,6 +249,110 @@ mod tests {
         let shown = format!("{config:?}");
         assert!(shown.contains("ingest"));
         assert!(!shown.contains("hunter2"));
+    }
+
+    #[test]
+    fn test_error_code_reads_the_server_exception_code() {
+        assert_eq!(
+            error_code("Code: 60. DB::Exception: Table x.events does not exist."),
+            Some(60)
+        );
+        assert_eq!(error_code("Code: abc. DB::Exception"), None);
+        assert_eq!(error_code("502 Bad Gateway"), None);
+    }
+
+    #[test]
+    fn test_error_kind_separates_bad_data_and_config_from_outages() {
+        let bad_response = |reason: &str| Error::BadResponse(reason.to_string());
+        let cases = [
+            (
+                bad_response("Code: 469. DB::Exception: Constraint violated"),
+                ErrorKind::BadData,
+            ),
+            (Error::Custom("bad row".to_string()), ErrorKind::BadData),
+            (
+                bad_response("Code: 516. DB::Exception: Authentication failed"),
+                ErrorKind::Config,
+            ),
+            (
+                bad_response("Code: 81. DB::Exception: Database x does not exist"),
+                ErrorKind::Config,
+            ),
+            (Error::SchemaMismatch("x".to_string()), ErrorKind::Config),
+            (
+                bad_response("Code: 202. DB::Exception: Too many simultaneous queries"),
+                ErrorKind::Transient,
+            ),
+            (
+                bad_response("503 Service Unavailable"),
+                ErrorKind::Transient,
+            ),
+            (Error::TimedOut, ErrorKind::Transient),
+            (Error::Network("refused".into()), ErrorKind::Transient),
+        ];
+        for (error, kind) in cases {
+            assert_eq!(error_kind(&error), kind, "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_passes_for_the_events_table() {
+        let db = ClickHouseTestDatabase::create().await;
+        ClickHouseWriter::new(db.config.clone())
+            .check()
+            .await
+            .unwrap();
+        db.drop_db().await;
+    }
+
+    #[tokio::test]
+    async fn test_check_fails_with_a_config_error_on_bad_config() {
+        let db = ClickHouseTestDatabase::create().await;
+        db.client
+            .query("ALTER TABLE events RENAME COLUMN sdk_version TO version")
+            .execute()
+            .await
+            .unwrap();
+        let configs = [
+            ClickHouseConfig {
+                password: "wrong".to_string(),
+                ..db.config.clone()
+            },
+            ClickHouseConfig {
+                database: "missing".to_string(),
+                ..db.config.clone()
+            },
+            ClickHouseConfig {
+                table: "missing".to_string(),
+                ..db.config.clone()
+            },
+            // The renamed column.
+            db.config.clone(),
+        ];
+
+        for config in configs {
+            let error = ClickHouseWriter::new(config.clone())
+                .check()
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Config, "{config:?}: {error}");
+        }
+        db.drop_db().await;
+    }
+
+    #[tokio::test]
+    async fn test_check_fails_with_a_transient_error_when_unreachable() {
+        let writer = ClickHouseWriter::new(ClickHouseConfig {
+            url: "http://127.0.0.1:1".to_string(),
+            user: "default".to_string(),
+            password: String::new(),
+            database: "default".to_string(),
+            table: "events".to_string(),
+        });
+        assert_eq!(
+            writer.check().await.unwrap_err().kind(),
+            ErrorKind::Transient
+        );
     }
 
     fn batch_config(flush_interval: Duration) -> BatchConfig {
