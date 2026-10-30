@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::hash::{BuildHasher, RandomState};
 use std::mem;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,10 +11,15 @@ use tracing::{error, warn};
 use super::SinkError;
 use crate::models::EventRecord;
 
-/// Retries after the first failed write, before the batch is dropped.
-const MAX_RETRIES: u32 = 3;
-/// Doubles per retry: about 200 ms, 400 ms, 800 ms before jitter.
-const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+/// Waits between write attempts before the batch is dropped: about 17 s in
+/// all, to ride out a ClickHouse restart.
+const RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(5),
+    Duration::from_secs(5),
+];
 
 /// Writes one batch of records to a store.
 pub trait BatchWriter: Send + Sync + 'static {
@@ -117,28 +121,18 @@ async fn flush<W: BatchWriter>(shared: &Shared<W>) {
 }
 
 async fn write_with_retries<W: BatchWriter>(writer: &W, records: &[EventRecord]) {
-    let mut retry = 0;
-    loop {
+    for (retry, delay) in RETRY_DELAYS.into_iter().enumerate() {
         match writer.write(records).await {
             Ok(()) => return,
-            Err(e) if retry < MAX_RETRIES => {
-                warn!(rows = records.len(), retry, error = %e, "Sink batch write failed, retrying");
-                tokio::time::sleep(backoff(retry)).await;
-                retry += 1;
-            }
             Err(e) => {
-                error!(rows = records.len(), error = %e, "Sink batch dropped after retries");
-                return;
+                warn!(rows = records.len(), retry, error = %e, "Sink batch write failed, retrying");
+                tokio::time::sleep(delay).await;
             }
         }
     }
-}
-
-/// Exponential backoff with ±50% jitter, so tasks that failed together do not
-/// retry together.
-fn backoff(retry: u32) -> Duration {
-    let jitter_permille = RandomState::new().hash_one(retry) % 1000;
-    (RETRY_BASE_DELAY * 2u32.pow(retry)).mul_f64(0.5 + jitter_permille as f64 / 1000.0)
+    if let Err(e) = writer.write(records).await {
+        error!(rows = records.len(), error = %e, "Sink batch dropped after retries");
+    }
 }
 
 #[cfg(test)]
@@ -253,11 +247,11 @@ mod tests {
         let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(1), 1));
 
         sink.put(records(&[1]));
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
 
         assert_eq!(
             writer.attempts.load(Ordering::SeqCst),
-            1 + MAX_RETRIES as usize
+            1 + RETRY_DELAYS.len()
         );
         sink.put(records(&[2]));
     }
@@ -271,14 +265,5 @@ mod tests {
         sink.shutdown(Duration::from_secs(1)).await;
 
         assert_eq!(*writer.written.lock().unwrap(), vec![vec![1, 2, 3]]);
-    }
-
-    #[test]
-    fn test_backoff_doubles_within_the_jitter_band() {
-        for retry in 0..MAX_RETRIES {
-            let base = RETRY_BASE_DELAY * 2u32.pow(retry);
-            let delay = backoff(retry);
-            assert!(delay >= base / 2 && delay < base * 3 / 2, "{delay:?}");
-        }
     }
 }

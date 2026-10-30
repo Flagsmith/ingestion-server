@@ -88,7 +88,7 @@ With `KAFKA_AUTH=scram`, the producer authenticates with SASL/SCRAM-SHA-512 over
 
 ### ClickHouse sink
 
-With `SINK=clickhouse`, `202` means the events are buffered in memory, not yet stored. A background task takes the whole buffer every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_FLUSH_MAX_EVENTS` events are waiting, and writes it as one `INSERT`. A failed batch is retried 3 times and then dropped with an error log. The buffer is unbounded: requests never wait or get `503`, so while a write is slow or failing (up to about 2 minutes with retries) it grows by the ingest rate times the write time, and the next flush takes it all. A normal shutdown (SIGTERM) flushes the buffer, but events still buffered are lost if the process crashes.
+With `SINK=clickhouse`, `202` means the events are buffered in memory, not yet stored. A background task takes the whole buffer every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_FLUSH_MAX_EVENTS` events are waiting, and writes it as one `INSERT`. A failed batch is retried 5 times over about 17 seconds, enough to ride out a ClickHouse restart, and then dropped with an error log. The buffer is unbounded: requests never wait or get `503`, so while a write is slow or failing (up to about 3 minutes with retries) it grows by the ingest rate times the write time, and the next flush takes it all. A normal shutdown (SIGTERM) flushes the buffer, but events still buffered are lost if the process crashes.
 
 ## Run locally
 
