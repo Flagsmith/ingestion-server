@@ -8,7 +8,7 @@ Rust + axum, deployed as an ARM64 container on ECS Fargate.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/health` | Liveness probe → `{"status":"healthy"}`. Touches no downstream; returns `503` once the Kafka producer has hit a fatal error, so ECS replaces the task. |
+| GET | `/health` | Liveness probe → `{"status":"healthy"}`. Touches no downstream; returns `503` once the sink has hit a fatal error (the Kafka producer's, or a ClickHouse config error), so ECS replaces the task. |
 | POST | `/v1/events` | Ingest an event batch. Requires the `X-Environment-Key` header. |
 
 `POST /v1/events` validates each event independently — invalid events are rejected individually and never block valid ones in the same batch.
@@ -88,11 +88,11 @@ With `KAFKA_AUTH=scram`, the producer authenticates with SASL/SCRAM-SHA-512 over
 
 ### ClickHouse sink
 
-With `SINK=clickhouse`, `202` means the events are buffered in memory, not yet stored. A background task takes the whole buffer every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_FLUSH_MAX_EVENTS` events are waiting, and writes it as one `INSERT`. A failed batch is retried 3 times and then dropped with an error log. The buffer is unbounded: requests never wait or get `503`, so while a write is slow or failing (up to about 2 minutes with retries) it grows by the ingest rate times the write time, and the next flush takes it all. A normal shutdown (SIGTERM) flushes the buffer, but events still buffered are lost if the process crashes.
+With `SINK=clickhouse`, `202` means the events are buffered in memory, not yet stored. A background task takes the whole buffer every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_FLUSH_MAX_EVENTS` events are waiting, and writes it as one `INSERT`. A batch that fails with a transient error (network, timeout, overload, or anything unrecognised) is retried 5 times over about 17 seconds, enough to ride out a ClickHouse restart, and then dropped with an error log; these never affect `/health`. Rows the table rejects (parse, type or constraint errors) drop the batch at once, with an error log, and leave `/health` alone. A config error (bad credentials or grants, or a missing database, table or column) drops the batch at once and fails `/health` until restart. At startup the server checks that ClickHouse is reachable, accepts the credentials, and has a table whose columns match, and exits with an error if not. The buffer is unbounded: requests never wait or get `503`, so while a write is slow or failing (up to about 3 minutes with retries) it grows by the ingest rate times the write time, and the next flush takes it all. A normal shutdown (SIGTERM) flushes the buffer, but events still buffered are lost if the process crashes.
 
 ### PostgreSQL sink
 
-With `SINK=postgres`, events are buffered and flushed as with the ClickHouse sink, and each batch is written to `flagsmith_exp.events` in Flagsmith's Postgres, at `DATABASE_URL`, as one `INSERT` in a transaction. Flagsmith's migrations create the table. The sink shares the server's connection pool. If the server's role does not own the table, grant it:
+With `SINK=postgres`, events are buffered, flushed and retried as with the ClickHouse sink, and each batch is written to `flagsmith_exp.events` in Flagsmith's Postgres, at `DATABASE_URL`, as one `INSERT` in a transaction. Flagsmith's migrations create the table. The sink shares the server's connection pool. A missing table or column, or a permission or authentication error, fails `/health` until restart. If the server's role does not own the table, grant it:
 
 ```sql
 GRANT USAGE ON SCHEMA flagsmith_exp TO ingestion_server;

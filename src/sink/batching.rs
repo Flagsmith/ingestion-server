@@ -1,7 +1,6 @@
 use std::future::Future;
-use std::hash::{BuildHasher, RandomState};
 use std::mem;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::Notify;
@@ -9,13 +8,18 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{error, warn};
 
-use super::SinkError;
+use super::{ErrorKind, SinkError};
 use crate::models::EventRecord;
 
-/// Retries after the first failed write, before the batch is dropped.
-const MAX_RETRIES: u32 = 3;
-/// Doubles per retry: about 200 ms, 400 ms, 800 ms before jitter.
-const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+/// Waits between attempts to write a batch that failed with a transient error,
+/// before it is dropped: about 17 s in all, to ride out a ClickHouse restart.
+const RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(5),
+    Duration::from_secs(5),
+];
 
 /// Writes one batch of records to a store.
 pub trait BatchWriter: Send + Sync + 'static {
@@ -36,6 +40,8 @@ struct Shared<W: BatchWriter> {
     buffer: Mutex<Vec<EventRecord>>,
     flush_now: Notify,
     stop: Notify,
+    /// The first config error; stays set until restart.
+    fatal_error: OnceLock<String>,
 }
 
 pub struct BatchingSink<W: BatchWriter> {
@@ -60,6 +66,7 @@ impl<W: BatchWriter> BatchingSink<W> {
             buffer: Mutex::new(Vec::new()),
             flush_now: Notify::new(),
             stop: Notify::new(),
+            fatal_error: OnceLock::new(),
         });
         let flusher = tokio::spawn(run(shared.clone()));
         Self {
@@ -75,6 +82,12 @@ impl<W: BatchWriter> BatchingSink<W> {
         if buffer.len() >= self.shared.config.flush_max_events {
             self.shared.flush_now.notify_one();
         }
+    }
+
+    /// A config error, such as bad credentials or a missing table, that
+    /// stops every write until the server is fixed.
+    pub fn fatal_error(&self) -> Option<String> {
+        self.shared.fatal_error.get().cloned()
     }
 
     /// Stop the flusher and write what is buffered, bounded by `timeout`.
@@ -113,32 +126,37 @@ async fn flush<W: BatchWriter>(shared: &Shared<W>) {
     if records.is_empty() {
         return;
     }
-    write_with_retries(&shared.writer, &records).await;
+    write_with_retries(shared, &records).await;
 }
 
-async fn write_with_retries<W: BatchWriter>(writer: &W, records: &[EventRecord]) {
-    let mut retry = 0;
-    loop {
-        match writer.write(records).await {
-            Ok(()) => return,
-            Err(e) if retry < MAX_RETRIES => {
-                warn!(rows = records.len(), retry, error = %e, "Sink batch write failed, retrying");
-                tokio::time::sleep(backoff(retry)).await;
-                retry += 1;
+/// Retries transient errors per `RETRY_DELAYS`. Drops the batch at once on
+/// bad data or a config error, and records a config error to fail the health
+/// check.
+async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, records: &[EventRecord]) {
+    let rows = records.len();
+    for retry in 0.. {
+        let Err(e) = shared.writer.write(records).await else {
+            return;
+        };
+        match e.kind() {
+            ErrorKind::Transient => {}
+            ErrorKind::BadData => {
+                error!(rows, error = %e, "Sink batch dropped: rows rejected");
+                return;
             }
-            Err(e) => {
-                error!(rows = records.len(), error = %e, "Sink batch dropped after retries");
+            ErrorKind::Config => {
+                error!(rows, error = %e, "Sink batch dropped: sink misconfigured");
+                let _ = shared.fatal_error.set(e.to_string());
                 return;
             }
         }
+        let Some(&delay) = RETRY_DELAYS.get(retry) else {
+            error!(rows, error = %e, "Sink batch dropped after retries");
+            return;
+        };
+        warn!(rows, retry, error = %e, "Sink batch write failed, retrying");
+        tokio::time::sleep(delay).await;
     }
-}
-
-/// Exponential backoff with ±50% jitter, so tasks that failed together do not
-/// retry together.
-fn backoff(retry: u32) -> Duration {
-    let jitter_permille = RandomState::new().hash_one(retry) % 1000;
-    (RETRY_BASE_DELAY * 2u32.pow(retry)).mul_f64(0.5 + jitter_permille as f64 / 1000.0)
 }
 
 #[cfg(test)]
@@ -147,11 +165,12 @@ mod tests {
 
     use super::*;
 
-    /// Records every write attempt; each takes `delay`, and all fail when
-    /// `fail` is set.
+    /// Records every write attempt; each takes `delay`, and the first
+    /// `failures` fail with `error`.
     #[derive(Clone, Default)]
     struct FakeWriter {
-        fail: bool,
+        failures: usize,
+        error: Option<fn() -> clickhouse::error::Error>,
         delay: Duration,
         attempts: Arc<AtomicUsize>,
         written: Arc<Mutex<Vec<Vec<i64>>>>,
@@ -159,10 +178,11 @@ mod tests {
 
     impl BatchWriter for FakeWriter {
         async fn write(&self, records: &[EventRecord]) -> Result<(), SinkError> {
-            self.attempts.fetch_add(1, Ordering::SeqCst);
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
-            if self.fail {
-                return Err(clickhouse::error::Error::Custom("failed".to_string()).into());
+            if attempt < self.failures {
+                let error = self.error.expect("an error to fail with");
+                return Err(error().into());
             }
             let timestamps = records.iter().map(|record| record.timestamp).collect();
             self.written.lock().unwrap().push(timestamps);
@@ -247,19 +267,59 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_drops_a_batch_after_the_retries() {
         let writer = FakeWriter {
-            fail: true,
+            failures: usize::MAX,
+            error: Some(|| clickhouse::error::Error::TimedOut),
             ..FakeWriter::default()
         };
         let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(1), 1));
 
         sink.put(records(&[1]));
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
 
         assert_eq!(
             writer.attempts.load(Ordering::SeqCst),
-            1 + MAX_RETRIES as usize
+            1 + RETRY_DELAYS.len()
         );
+        assert_eq!(sink.fatal_error(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drops_bad_data_without_retries_and_stays_healthy() {
+        let writer = FakeWriter {
+            failures: 1,
+            error: Some(|| clickhouse::error::Error::Custom("bad row".to_string())),
+            ..FakeWriter::default()
+        };
+        let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(3600), 1));
+
+        sink.put(records(&[1]));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(writer.attempts.load(Ordering::SeqCst), 1);
+        assert!(writer.written.lock().unwrap().is_empty());
+        assert_eq!(sink.fatal_error(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_drops_a_batch_without_retries_on_a_config_error() {
+        let writer = FakeWriter {
+            failures: 1,
+            error: Some(|| clickhouse::error::Error::SchemaMismatch("no column".to_string())),
+            ..FakeWriter::default()
+        };
+        let sink = BatchingSink::new(writer.clone(), config(Duration::from_secs(3600), 1));
+
+        sink.put(records(&[1]));
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(writer.attempts.load(Ordering::SeqCst), 1);
+        assert!(writer.written.lock().unwrap().is_empty());
+        let fatal_error = sink.fatal_error();
+        assert!(fatal_error.is_some());
+
+        // Stays set after a later write succeeds.
         sink.put(records(&[2]));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(*writer.written.lock().unwrap(), vec![vec![2]]);
+        assert_eq!(sink.fatal_error(), fatal_error);
     }
 
     #[tokio::test(start_paused = true)]
@@ -271,14 +331,5 @@ mod tests {
         sink.shutdown(Duration::from_secs(1)).await;
 
         assert_eq!(*writer.written.lock().unwrap(), vec![vec![1, 2, 3]]);
-    }
-
-    #[test]
-    fn test_backoff_doubles_within_the_jitter_band() {
-        for retry in 0..MAX_RETRIES {
-            let base = RETRY_BASE_DELAY * 2u32.pow(retry);
-            let delay = backoff(retry);
-            assert!(delay >= base / 2 && delay < base * 3 / 2, "{delay:?}");
-        }
     }
 }

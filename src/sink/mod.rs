@@ -46,7 +46,8 @@ impl Sink {
     pub fn fatal_error(&self) -> Option<String> {
         match self {
             Self::Kafka(sink) => sink.fatal_error(),
-            Self::ClickHouse(_) | Self::Postgres(_) => None,
+            Self::ClickHouse(sink) => sink.fatal_error(),
+            Self::Postgres(sink) => sink.fatal_error(),
         }
     }
 
@@ -70,4 +71,28 @@ pub enum SinkError {
     Postgres(#[from] sqlx::Error),
     #[error("PostgreSQL insert timed out")]
     PostgresTimeout,
+}
+
+/// What a failed write means for the batch and the server.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ErrorKind {
+    /// May pass on retry: network, timeout, overload, or unrecognised.
+    Transient,
+    /// The store rejects the rows; retrying cannot help.
+    BadData,
+    /// The server is misconfigured, e.g. bad credentials or a missing
+    /// table; nothing will be written until it is fixed.
+    Config,
+}
+
+impl SinkError {
+    /// Only batching sinks retry; the Kafka producer retries internally.
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Self::Kafka(_) => ErrorKind::Transient,
+            Self::ClickHouse(e) => clickhouse::error_kind(e),
+            Self::Postgres(e) => postgres::error_kind(e),
+            Self::PostgresTimeout => ErrorKind::Transient,
+        }
+    }
 }

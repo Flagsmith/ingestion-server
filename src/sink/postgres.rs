@@ -5,8 +5,24 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
 use super::batching::BatchWriter;
-use super::SinkError;
+use super::{ErrorKind, SinkError};
 use crate::models::EventRecord;
+
+/// SQLSTATE classes for rows the table rejects: data exceptions and integrity
+/// constraint violations.
+const BAD_DATA_SQLSTATE_CLASSES: [&str; 2] = ["22", "23"];
+
+/// SQLSTATEs for bad credentials or grants, or a missing database, schema,
+/// table or column.
+const CONFIG_SQLSTATES: [&str; 7] = [
+    "28000", // invalid_authorization_specification
+    "28P01", // invalid_password
+    "3D000", // invalid_catalog_name
+    "3F000", // invalid_schema_name
+    "42501", // insufficient_privilege
+    "42P01", // undefined_table
+    "42703", // undefined_column
+];
 
 /// `statement_timeout` is enforced by the server, so a stalled connection is
 /// caught by this instead.
@@ -78,6 +94,24 @@ fn storable_text(text: &str) -> Cow<'_, str> {
 /// never used; it avoids a panic, which aborts the process.
 fn epoch_ms_to_datetime(epoch_ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(epoch_ms).unwrap_or_default()
+}
+
+/// Anything unrecognised, such as a network error, pool timeout or
+/// cancelled statement, counts as transient.
+pub(super) fn error_kind(error: &sqlx::Error) -> ErrorKind {
+    let Some(sqlstate) = error.as_database_error().and_then(|e| e.code()) else {
+        return ErrorKind::Transient;
+    };
+    if CONFIG_SQLSTATES.contains(&sqlstate.as_ref()) {
+        ErrorKind::Config
+    } else if sqlstate
+        .get(..2)
+        .is_some_and(|class| BAD_DATA_SQLSTATE_CLASSES.contains(&class))
+    {
+        ErrorKind::BadData
+    } else {
+        ErrorKind::Transient
+    }
 }
 
 fn column_array<'r, 'a, T>(
