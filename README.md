@@ -67,7 +67,7 @@ On the wire to Kafka, `traits` and `metadata` are produced as JSON-encoded strin
 | `SINK_FLUSH_INTERVAL_MS` | no | `1000` |
 | `SINK_FLUSH_MAX_EVENTS` | no | `5000` |
 | `SINK_WAL_DIR` | no | unset (buffer in memory) |
-| `SINK_DRAIN_TIMEOUT_SECS` | no | `100` (with `SINK_WAL_DIR`) |
+| `SINK_WAL_DRAIN_TIMEOUT_SECS` | no | `100` (with `SINK_WAL_DIR`) |
 | `SINK_WAL_MAX_BYTES` | no | unset (no cap) |
 | `DATABASE_URL` | yes | — |
 | `LISTEN_ADDR` | no | `0.0.0.0:8080` |
@@ -102,12 +102,12 @@ With `SINK=clickhouse` and `SINK_WAL_DIR` set, the server buffers events in a wr
 - **Config errors** fail `/health` until restart; the events stay in the WAL and are retried.
 - **Outages**: the WAL grows by the ingest rate for as long as ClickHouse is down. Once it holds `SINK_WAL_MAX_BYTES` of events, new requests get `503`. The cap counts event bytes, not the file size, and the file never shrinks, so set it well below the volume size (about 70%). Without a cap, a full disk also fails requests with `503`.
 - **Restart**: the server writes what the WAL holds before anything new.
-- **Shutdown** (SIGTERM): after in-flight requests finish, the server keeps writing until the WAL is empty or `SINK_DRAIN_TIMEOUT_SECS` passes; whatever is left stays in the WAL for the next start.
+- **Shutdown** (SIGTERM): after in-flight requests finish, the server keeps writing until the WAL is empty or `SINK_WAL_DRAIN_TIMEOUT_SECS` passes; whatever is left stays in the WAL for the next start.
 
 Deployment requirements:
 
 - `SINK_WAL_DIR` must be on a persistent volume, one per instance: a second process cannot open the same WAL. ECS Fargate has no persistent disk, so the WAL is not supported there.
-- The orchestrator's grace period must exceed the drain timeout, e.g. Kubernetes `terminationGracePeriodSeconds` above `SINK_DRAIN_TIMEOUT_SECS`.
+- The orchestrator's grace period must exceed the drain timeout, e.g. Kubernetes `terminationGracePeriodSeconds` above `SINK_WAL_DRAIN_TIMEOUT_SECS`.
 - On Kubernetes, run a StatefulSet with `persistentVolumeClaimRetentionPolicy.whenScaled: Retain`. On scale-down the drain writes what it can; events left behind stay on the retained volume and are written when the instance with that ordinal comes back.
 
 ## Run locally

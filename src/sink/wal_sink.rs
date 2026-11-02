@@ -22,7 +22,7 @@ struct Shared<W: BatchWriter> {
     wal: WalHandle,
     config: BatchConfig,
     /// Events appended since the flusher last read the WAL.
-    pending: AtomicUsize,
+    events_since_read: AtomicUsize,
     flush_now: Notify,
     stop: Notify,
     /// The first config error; stays set until restart.
@@ -52,7 +52,7 @@ impl<W: BatchWriter> WalSink<W> {
             writer,
             wal,
             config,
-            pending: AtomicUsize::new(0),
+            events_since_read: AtomicUsize::new(0),
             flush_now: Notify::new(),
             stop: Notify::new(),
             fatal_error: OnceLock::new(),
@@ -68,8 +68,12 @@ impl<W: BatchWriter> WalSink<W> {
     pub async fn put(&self, records: Vec<EventRecord>) -> Result<(), SinkError> {
         let events = records.len();
         self.shared.wal.append(records).await?;
-        let pending = self.shared.pending.fetch_add(events, Ordering::SeqCst) + events;
-        if pending >= self.shared.config.flush_max_events {
+        let events_since_read = self
+            .shared
+            .events_since_read
+            .fetch_add(events, Ordering::SeqCst)
+            + events;
+        if events_since_read >= self.shared.config.flush_max_events {
             self.shared.flush_now.notify_one();
         }
         Ok(())
@@ -106,17 +110,17 @@ async fn run<W: BatchWriter>(shared: Arc<Shared<W>>) {
     let period = shared.config.flush_interval;
     let mut interval = tokio::time::interval_at(Instant::now() + period, period);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut backlog = true;
+    let mut has_backlog = true;
     let mut draining = false;
     loop {
-        if !backlog && !draining {
+        if !has_backlog && !draining {
             tokio::select! {
                 _ = interval.tick() => {}
                 _ = shared.flush_now.notified() => {}
                 _ = shared.stop.notified() => draining = true,
             }
         }
-        shared.pending.store(0, Ordering::SeqCst);
+        shared.events_since_read.store(0, Ordering::SeqCst);
         let chunk = match shared.wal.read_oldest(shared.config.flush_max_events).await {
             Ok(chunk) => chunk,
             Err(e) => {
@@ -124,11 +128,11 @@ async fn run<W: BatchWriter>(shared: Arc<Shared<W>>) {
                 if draining {
                     return;
                 }
-                backlog = false;
+                has_backlog = false;
                 continue;
             }
         };
-        backlog = chunk.records.len() >= shared.config.flush_max_events;
+        has_backlog = chunk.records.len() >= shared.config.flush_max_events;
         if chunk.is_empty() {
             if draining {
                 return;
@@ -143,16 +147,16 @@ async fn run<W: BatchWriter>(shared: Arc<Shared<W>>) {
 /// config errors until the write succeeds, recording a config error to fail
 /// the health check; moves the chunk to the rejected table on bad data.
 async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, chunk: Chunk) {
-    if chunk.undecodable > 0 {
+    if chunk.undecodable_rows > 0 {
         error!(
-            rows = chunk.undecodable,
+            rows = chunk.undecodable_rows,
             "Sink rows undecodable, moved to the WAL's rejected table"
         );
     }
-    let rows = chunk.records.len();
+    let events = chunk.records.len();
     let mut delay = FIRST_RETRY_DELAY;
     loop {
-        let result = if rows == 0 {
+        let result = if events == 0 {
             Ok(())
         } else {
             shared.writer.write(&chunk.records).await
@@ -160,7 +164,7 @@ async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, chunk: Chunk) {
         let e = match result {
             Ok(()) => {
                 if let Err(e) = shared.wal.remove(chunk).await {
-                    error!(rows, error = %e, "Sink rows written but left in the WAL; they will be written again");
+                    error!(events, error = %e, "Sink rows written but left in the WAL; they will be written again");
                 }
                 return;
             }
@@ -168,17 +172,17 @@ async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, chunk: Chunk) {
         };
         match e.kind() {
             ErrorKind::Transient => {
-                warn!(rows, error = %e, "Sink chunk write failed, retrying");
+                warn!(events, error = %e, "Sink chunk write failed, retrying");
             }
             ErrorKind::BadData => {
-                error!(rows, error = %e, "Sink rows rejected, moved to the WAL's rejected table");
+                error!(events, error = %e, "Sink rows rejected, moved to the WAL's rejected table");
                 if let Err(e) = shared.wal.reject(chunk).await {
-                    error!(rows, error = %e, "Sink rows not moved to the rejected table");
+                    error!(events, error = %e, "Sink rows not moved to the rejected table");
                 }
                 return;
             }
             ErrorKind::Config => {
-                error!(rows, error = %e, "Sink chunk write failed: sink misconfigured");
+                error!(events, error = %e, "Sink chunk write failed: sink misconfigured");
                 let _ = shared.fatal_error.set(e.to_string());
             }
         }
@@ -207,7 +211,7 @@ mod tests {
     }
 
     /// Waits up to 5 s for `condition`.
-    async fn eventually(condition: impl Fn() -> bool) {
+    async fn wait_for(condition: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !condition() {
             assert!(Instant::now() < deadline, "timed out");
@@ -215,7 +219,7 @@ mod tests {
         }
     }
 
-    /// The WAL writer thread closes the file a moment after its last handle
+    /// The WAL thread closes the file a moment after its last handle
     /// is dropped.
     async fn reopen(dir: &Path) -> Wal {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -228,7 +232,7 @@ mod tests {
         }
     }
 
-    async fn wal_events(wal: &WalHandle) -> Vec<i64> {
+    async fn wal_timestamps(wal: &WalHandle) -> Vec<i64> {
         let chunk = wal.read_oldest(usize::MAX).await.unwrap();
         chunk
             .records
@@ -238,9 +242,9 @@ mod tests {
     }
 
     /// Waits up to 5 s for the flusher to empty the WAL.
-    async fn eventually_empty(wal: &WalHandle) {
+    async fn wait_for_empty_wal(wal: &WalHandle) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !wal_events(wal).await.is_empty() {
+        while !wal_timestamps(wal).await.is_empty() {
             assert!(Instant::now() < deadline, "timed out");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -256,9 +260,9 @@ mod tests {
         // One put: the flusher's startup read sees all of it or none.
         sink.put(records(&[1, 2])).await.unwrap();
 
-        eventually(|| !writer.written.lock().unwrap().is_empty()).await;
+        wait_for(|| !writer.written.lock().unwrap().is_empty()).await;
         assert_eq!(*writer.written.lock().unwrap(), vec![vec![1, 2]]);
-        eventually_empty(&wal).await;
+        wait_for_empty_wal(&wal).await;
     }
 
     #[tokio::test]
@@ -269,7 +273,7 @@ mod tests {
         let writer = FakeWriter::default();
         let _sink = WalSink::new(writer.clone(), WalHandle::spawn(wal), config(100));
 
-        eventually(|| !writer.written.lock().unwrap().is_empty()).await;
+        wait_for(|| !writer.written.lock().unwrap().is_empty()).await;
         assert_eq!(*writer.written.lock().unwrap(), vec![vec![1, 2]]);
     }
 
@@ -285,7 +289,7 @@ mod tests {
 
         sink.put(records(&[1])).await.unwrap();
 
-        eventually(|| !writer.written.lock().unwrap().is_empty()).await;
+        wait_for(|| !writer.written.lock().unwrap().is_empty()).await;
         assert_eq!(writer.attempts.load(Ordering::SeqCst), 2);
         assert_eq!(sink.fatal_error(), None);
     }
@@ -341,7 +345,7 @@ mod tests {
         let sink = WalSink::new(writer.clone(), spawn_wal(dir.path()), config(1));
 
         sink.put(records(&[1, 2])).await.unwrap();
-        eventually(|| writer.attempts.load(Ordering::SeqCst) > 0).await;
+        wait_for(|| writer.attempts.load(Ordering::SeqCst) > 0).await;
         sink.shutdown(Duration::from_millis(100)).await;
 
         let wal = reopen(dir.path()).await;
@@ -361,8 +365,8 @@ mod tests {
 
         sink.put(records(&[1])).await.unwrap();
 
-        eventually(|| writer.attempts.load(Ordering::SeqCst) > 0).await;
-        eventually_empty(&wal).await;
+        wait_for(|| writer.attempts.load(Ordering::SeqCst) > 0).await;
+        wait_for_empty_wal(&wal).await;
         assert!(writer.written.lock().unwrap().is_empty());
         assert_eq!(sink.fatal_error(), None);
     }
@@ -380,8 +384,8 @@ mod tests {
 
         sink.put(records(&[1])).await.unwrap();
 
-        eventually(|| sink.fatal_error().is_some()).await;
-        assert_eq!(wal_events(&wal).await, vec![1]);
+        wait_for(|| sink.fatal_error().is_some()).await;
+        assert_eq!(wal_timestamps(&wal).await, vec![1]);
     }
 
     #[tokio::test]

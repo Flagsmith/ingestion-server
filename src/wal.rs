@@ -5,9 +5,9 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 
 use crate::models::EventRecord;
 
-mod writer;
+mod handle;
 
-pub use writer::WalHandle;
+pub use handle::WalHandle;
 
 /// One row per appended batch. Keys are microseconds since the epoch, bumped
 /// past the last key so they keep increasing even if the clock steps back.
@@ -19,10 +19,10 @@ const REJECTED: TableDefinition<u64, &[u8]> = TableDefinition::new("rejected");
 /// Durable log of accepted batches, stored in `wal.redb` under a directory.
 pub struct Wal {
     db: Database,
-    next: u64,
+    next_key: u64,
     /// Bytes held in the batches table. The file never shrinks, so its size
     /// says nothing about the backlog.
-    bytes: u64,
+    held_bytes: u64,
     max_bytes: Option<u64>,
 }
 
@@ -33,7 +33,7 @@ pub struct Chunk {
     pub records: Vec<EventRecord>,
     /// Rows that no longer decode as `EventRecord`s, e.g. after a schema
     /// change. Either way they move to the rejected table.
-    pub undecodable: usize,
+    pub undecodable_rows: usize,
     keys: Vec<u64>,
     undecodable_keys: Vec<u64>,
 }
@@ -50,22 +50,22 @@ impl Wal {
         let db = Database::create(dir.join("wal.redb")).map_err(redb::Error::from)?;
 
         let txn = db.begin_write().map_err(redb::Error::from)?;
-        let (last, bytes) = {
+        let (last, held_bytes) = {
             let table = txn.open_table(BATCHES).map_err(redb::Error::from)?;
             let last = table.last().map_err(redb::Error::from)?;
-            let mut bytes = 0;
+            let mut held_bytes = 0;
             for row in table.iter().map_err(redb::Error::from)? {
                 let (_, value) = row.map_err(redb::Error::from)?;
-                bytes += value.value().len() as u64;
+                held_bytes += value.value().len() as u64;
             }
-            (last.map(|(key, _)| key.value()), bytes)
+            (last.map(|(key, _)| key.value()), held_bytes)
         };
         txn.commit().map_err(redb::Error::from)?;
 
         Ok(Wal {
             db,
-            next: last.map_or(0, |key| key + 1),
-            bytes,
+            next_key: last.map_or(0, |key| key + 1),
+            held_bytes,
             max_bytes: None,
         })
     }
@@ -85,13 +85,13 @@ impl Wal {
             .iter()
             .map(|batch| serde_json::to_vec(batch).expect("EventRecords always serialize"))
             .collect();
-        let bytes = self.bytes + rows.iter().map(|row| row.len() as u64).sum::<u64>();
+        let bytes_after = self.held_bytes + rows.iter().map(|row| row.len() as u64).sum::<u64>();
         if let Some(max_bytes) = self.max_bytes {
-            if bytes > max_bytes {
+            if bytes_after > max_bytes {
                 return Err(WalError::Full { max_bytes });
             }
         }
-        let start = self.next.max(now_micros());
+        let start = self.next_key.max(now_micros());
 
         let mut txn = self.db.begin_write().map_err(redb::Error::from)?;
         txn.set_durability(Durability::Immediate)
@@ -105,8 +105,8 @@ impl Wal {
             }
         }
         txn.commit().map_err(redb::Error::from)?;
-        self.next = start + rows.len() as u64;
-        self.bytes = bytes;
+        self.next_key = start + rows.len() as u64;
+        self.held_bytes = bytes_after;
         Ok(())
     }
 
@@ -118,7 +118,7 @@ impl Wal {
 
         let mut chunk = Chunk {
             records: Vec::new(),
-            undecodable: 0,
+            undecodable_rows: 0,
             keys: Vec::new(),
             undecodable_keys: Vec::new(),
         };
@@ -134,7 +134,7 @@ impl Wal {
                     chunk.keys.push(key.value());
                 }
                 Err(_) => {
-                    chunk.undecodable += 1;
+                    chunk.undecodable_rows += 1;
                     chunk.undecodable_keys.push(key.value());
                 }
             }
@@ -145,30 +145,32 @@ impl Wal {
     /// Deletes a written chunk's rows, and moves its undecodable rows to the
     /// rejected table, in one durable commit.
     pub fn remove(&mut self, chunk: Chunk) -> Result<(), WalError> {
-        self.take(&chunk.keys, &chunk.undecodable_keys)
+        self.remove_rows(&chunk.keys, &chunk.undecodable_keys)
     }
 
     /// Moves all of a chunk's rows to the rejected table in one durable commit.
     pub fn reject(&mut self, chunk: Chunk) -> Result<(), WalError> {
-        self.take(&[], &[chunk.keys, chunk.undecodable_keys].concat())
+        self.remove_rows(&[], &[chunk.keys, chunk.undecodable_keys].concat())
     }
 
-    fn take(&mut self, delete: &[u64], move_to_rejected: &[u64]) -> Result<(), WalError> {
+    /// Deletes the `delete` rows and moves the `reject` rows to the rejected
+    /// table.
+    fn remove_rows(&mut self, delete: &[u64], reject: &[u64]) -> Result<(), WalError> {
         let mut txn = self.db.begin_write().map_err(redb::Error::from)?;
         txn.set_durability(Durability::Immediate)
             .map_err(redb::Error::from)?;
-        let mut taken = 0;
+        let mut freed_bytes = 0;
         {
             let mut batches = txn.open_table(BATCHES).map_err(redb::Error::from)?;
             let mut rejected = txn.open_table(REJECTED).map_err(redb::Error::from)?;
             for &key in delete {
                 if let Some(row) = batches.remove(key).map_err(redb::Error::from)? {
-                    taken += row.value().len() as u64;
+                    freed_bytes += row.value().len() as u64;
                 }
             }
-            for &key in move_to_rejected {
+            for &key in reject {
                 if let Some(row) = batches.remove(key).map_err(redb::Error::from)? {
-                    taken += row.value().len() as u64;
+                    freed_bytes += row.value().len() as u64;
                     rejected
                         .insert(key, row.value())
                         .map_err(redb::Error::from)?;
@@ -176,7 +178,7 @@ impl Wal {
             }
         }
         txn.commit().map_err(redb::Error::from)?;
-        self.bytes -= taken;
+        self.held_bytes -= freed_bytes;
         Ok(())
     }
 }
@@ -194,7 +196,7 @@ pub enum WalError {
     Storage(#[from] redb::Error),
     #[error("WAL IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("WAL writer thread stopped")]
+    #[error("WAL thread stopped")]
     Stopped,
     #[error("WAL full: appending would exceed {max_bytes} bytes")]
     Full { max_bytes: u64 },
@@ -227,7 +229,7 @@ mod tests {
         let txn = wal.db.begin_write().unwrap();
         txn.open_table(BATCHES).unwrap().insert(key, row).unwrap();
         txn.commit().unwrap();
-        wal.bytes += row.len() as u64;
+        wal.held_bytes += row.len() as u64;
     }
 
     fn rejected_rows(wal: &Wal) -> Vec<Vec<u8>> {
@@ -303,18 +305,18 @@ mod tests {
     }
 
     #[test]
-    fn test_returns_undecodable_rows_without_blocking_the_rest() {
+    fn test_skips_undecodable_rows_and_remove_rejects_them() {
         let dir = tempfile::tempdir().unwrap();
         let mut wal = Wal::open(dir.path()).unwrap();
         wal.append(&[records(&[1])]).unwrap();
-        let key = wal.next;
+        let key = wal.next_key;
         insert_raw(&mut wal, key, b"not json");
-        wal.next += 1;
+        wal.next_key += 1;
         wal.append(&[records(&[2])]).unwrap();
 
         let chunk = wal.read_oldest(100).unwrap();
         assert_eq!(chunk.records, records(&[1, 2]));
-        assert_eq!(chunk.undecodable, 1);
+        assert_eq!(chunk.undecodable_rows, 1);
 
         wal.remove(chunk).unwrap();
         assert!(wal.read_oldest(100).unwrap().is_empty());
@@ -364,7 +366,7 @@ mod tests {
     fn test_keys_keep_increasing_when_the_clock_steps_back() {
         let dir = tempfile::tempdir().unwrap();
         let mut wal = Wal::open(dir.path()).unwrap();
-        wal.next = u64::MAX - 10;
+        wal.next_key = u64::MAX - 10;
         wal.append(&[records(&[1]), records(&[2])]).unwrap();
 
         assert_eq!(
@@ -378,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_refuses_appends_past_the_cap_until_rows_are_taken() {
+    fn test_refuses_appends_past_the_cap_until_rows_are_removed() {
         let dir = tempfile::tempdir().unwrap();
         let row = row_bytes(&records(&[1]));
         let mut wal = Wal::open(dir.path()).unwrap().with_max_bytes(2 * row);
@@ -405,6 +407,6 @@ mod tests {
         drop(wal);
 
         let wal = Wal::open(dir.path()).unwrap();
-        assert_eq!(wal.bytes, 2 * row_bytes(&records(&[1])));
+        assert_eq!(wal.held_bytes, 2 * row_bytes(&records(&[1])));
     }
 }

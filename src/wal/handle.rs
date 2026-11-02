@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 use super::{Chunk, Wal, WalError};
 use crate::models::EventRecord;
 
-/// What the writer thread needs from the log: `Wal`, or a fake in tests.
+/// What the WAL thread needs from the log: `Wal`, or a fake in tests.
 pub trait Log: Send + 'static {
     fn append(&mut self, batches: &[Vec<EventRecord>]) -> Result<(), WalError>;
     fn read_oldest(&self, max_events: usize) -> Result<Chunk, WalError>;
@@ -54,9 +54,9 @@ impl WalHandle {
     pub fn spawn(log: impl Log) -> Self {
         let (requests, receiver) = mpsc::unbounded_channel();
         thread::Builder::new()
-            .name("wal-writer".to_string())
+            .name("wal".to_string())
             .spawn(move || run(log, receiver))
-            .expect("spawn the WAL writer thread");
+            .expect("spawn the WAL thread");
         WalHandle { requests }
     }
 

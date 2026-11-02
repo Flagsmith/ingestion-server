@@ -25,8 +25,8 @@ use wal::{Wal, WalHandle};
 
 const ENVIRONMENT_KEY_REFRESH_AFTER: Duration = Duration::from_secs(300);
 /// How long shutdown waits for a sink to write what it holds; the WAL sink
-/// uses `SINK_DRAIN_TIMEOUT_SECS` instead.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
+/// uses `SINK_WAL_DRAIN_TIMEOUT_SECS` instead.
+const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    let mut shutdown_timeout = SHUTDOWN_TIMEOUT;
+    let mut drain_timeout = DEFAULT_DRAIN_TIMEOUT;
     let (sink, external_topic) = match &config.sink {
         SinkConfig::Kafka(kafka) => {
             info!(
@@ -76,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
             let sink = match wal {
                 Some(wal_config) => {
                     let dir = &wal_config.dir;
-                    shutdown_timeout = wal_config.drain_timeout;
+                    drain_timeout = wal_config.drain_timeout;
                     let mut wal = Wal::open(dir)
                         .with_context(|| format!("Could not open the WAL in {}", dir.display()))?;
                     if let Some(max_bytes) = wal_config.max_bytes {
@@ -108,7 +108,7 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    sink.shutdown(shutdown_timeout).await;
+    sink.shutdown(drain_timeout).await;
 
     info!("Server shutdown complete");
     Ok(())
