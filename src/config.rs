@@ -18,9 +18,17 @@ pub enum SinkConfig {
     ClickHouse {
         clickhouse: ClickHouseConfig,
         batch: BatchConfig,
-        /// Buffer in a WAL in this directory rather than in memory.
-        wal_dir: Option<PathBuf>,
+        /// Buffer in a WAL rather than in memory.
+        wal: Option<WalConfig>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct WalConfig {
+    pub dir: PathBuf,
+    /// How long shutdown keeps writing the WAL out before leaving the rest
+    /// for the next start.
+    pub drain_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -38,7 +46,7 @@ impl Config {
             SinkKind::ClickHouse => SinkConfig::ClickHouse {
                 clickhouse: clickhouse_config_from_env()?,
                 batch: batch_config_from_env()?,
-                wal_dir: env::var_os("SINK_WAL_DIR").map(PathBuf::from),
+                wal: wal_config_from_env()?,
             },
         };
 
@@ -102,6 +110,17 @@ fn batch_config_from_env() -> Result<BatchConfig, ConfigError> {
         flush_interval: Duration::from_millis(positive_env_var("SINK_FLUSH_INTERVAL_MS", 1000)?),
         flush_max_events: positive_env_var("SINK_FLUSH_MAX_EVENTS", 5000)?,
     })
+}
+
+/// Set only when `SINK_WAL_DIR` is.
+fn wal_config_from_env() -> Result<Option<WalConfig>, ConfigError> {
+    let Some(dir) = env::var_os("SINK_WAL_DIR") else {
+        return Ok(None);
+    };
+    Ok(Some(WalConfig {
+        dir: PathBuf::from(dir),
+        drain_timeout: Duration::from_secs(positive_env_var("SINK_DRAIN_TIMEOUT_SECS", 100)?),
+    }))
 }
 
 fn positive_env_var<T: FromStr + Default + PartialOrd>(

@@ -24,6 +24,9 @@ use sink::{BatchingSink, ClickHouseWriter, KafkaSink, KafkaSinkConfig, Sink, Wal
 use wal::{Wal, WalHandle};
 
 const ENVIRONMENT_KEY_REFRESH_AFTER: Duration = Duration::from_secs(300);
+/// How long shutdown waits for a sink to write what it holds; the WAL sink
+/// uses `SINK_DRAIN_TIMEOUT_SECS` instead.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -36,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    let mut shutdown_timeout = SHUTDOWN_TIMEOUT;
     let (sink, external_topic) = match &config.sink {
         SinkConfig::Kafka(kafka) => {
             info!(
@@ -55,13 +59,13 @@ async fn main() -> anyhow::Result<()> {
         SinkConfig::ClickHouse {
             clickhouse,
             batch,
-            wal_dir,
+            wal,
         } => {
             info!(
                 listen_addr = %config.listen_addr,
                 clickhouse = ?clickhouse,
                 batch = ?batch,
-                wal_dir = ?wal_dir,
+                wal = ?wal,
                 "Starting flagsmith-analytics server"
             );
             let writer = ClickHouseWriter::new(clickhouse.clone());
@@ -69,8 +73,10 @@ async fn main() -> anyhow::Result<()> {
                 .check()
                 .await
                 .context("ClickHouse startup check failed")?;
-            let sink = match wal_dir {
-                Some(dir) => {
+            let sink = match wal {
+                Some(wal) => {
+                    let dir = &wal.dir;
+                    shutdown_timeout = wal.drain_timeout;
                     let wal = Wal::open(dir)
                         .with_context(|| format!("Could not open the WAL in {}", dir.display()))?;
                     Sink::ClickHouseWal(WalSink::new(writer, WalHandle::spawn(wal), batch.clone()))
@@ -99,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
-    sink.shutdown(Duration::from_secs(10)).await;
+    sink.shutdown(shutdown_timeout).await;
 
     info!("Server shutdown complete");
     Ok(())

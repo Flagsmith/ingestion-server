@@ -81,34 +81,39 @@ impl<W: BatchWriter> WalSink<W> {
         self.shared.fatal_error.get().cloned()
     }
 
-    /// Stop the flusher, bounded by `timeout`. Rows not yet written stay in
-    /// the WAL for the next start.
+    /// Write the WAL out until it is empty, retrying transient errors, bounded
+    /// by `timeout`. Rows not yet written stay in the WAL for the next start.
     pub async fn shutdown(self, timeout: Duration) {
         self.shared.stop.notify_one();
-        let Some(flusher) = self.flusher.lock().expect("flusher lock").take() else {
+        let Some(mut flusher) = self.flusher.lock().expect("flusher lock").take() else {
             return;
         };
-        match tokio::time::timeout(timeout, flusher).await {
+        match tokio::time::timeout(timeout, &mut flusher).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => warn!(error = %e, "Sink flush task failed"),
-            Err(_) => warn!("Sink flusher still writing at shutdown"),
+            Err(_) => {
+                flusher.abort();
+                warn!("Sink drain timed out; unwritten rows stay in the WAL for the next start");
+            }
         }
     }
 }
 
 /// Writes the WAL's oldest chunk, then the next one straight away while
 /// there is a backlog; otherwise waits for the interval or an early flush.
+/// Once stopped, writes chunk after chunk until the WAL is empty.
 async fn run<W: BatchWriter>(shared: Arc<Shared<W>>) {
     let period = shared.config.flush_interval;
     let mut interval = tokio::time::interval_at(Instant::now() + period, period);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut backlog = true;
+    let mut draining = false;
     loop {
-        if !backlog {
+        if !backlog && !draining {
             tokio::select! {
                 _ = interval.tick() => {}
                 _ = shared.flush_now.notified() => {}
-                _ = shared.stop.notified() => return,
+                _ = shared.stop.notified() => draining = true,
             }
         }
         shared.pending.store(0, Ordering::SeqCst);
@@ -116,25 +121,28 @@ async fn run<W: BatchWriter>(shared: Arc<Shared<W>>) {
             Ok(chunk) => chunk,
             Err(e) => {
                 error!(error = %e, "Sink could not read the WAL");
+                if draining {
+                    return;
+                }
                 backlog = false;
                 continue;
             }
         };
         backlog = chunk.records.len() >= shared.config.flush_max_events;
         if chunk.is_empty() {
+            if draining {
+                return;
+            }
             continue;
         }
-        if !write_with_retries(&shared, chunk).await {
-            return;
-        }
+        write_with_retries(&shared, chunk).await;
     }
 }
 
 /// Writes the chunk and removes it from the WAL. Retries transient and
 /// config errors until the write succeeds, recording a config error to fail
 /// the health check; moves the chunk to the rejected table on bad data.
-/// Returns false if stopped while waiting to retry.
-async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, chunk: Chunk) -> bool {
+async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, chunk: Chunk) {
     if chunk.undecodable > 0 {
         error!(
             rows = chunk.undecodable,
@@ -154,7 +162,7 @@ async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, chunk: Chunk) ->
                 if let Err(e) = shared.wal.remove(chunk).await {
                     error!(rows, error = %e, "Sink rows written but left in the WAL; they will be written again");
                 }
-                return true;
+                return;
             }
             Err(e) => e,
         };
@@ -167,17 +175,14 @@ async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, chunk: Chunk) ->
                 if let Err(e) = shared.wal.reject(chunk).await {
                     error!(rows, error = %e, "Sink rows not moved to the rejected table");
                 }
-                return true;
+                return;
             }
             ErrorKind::Config => {
                 error!(rows, error = %e, "Sink chunk write failed: sink misconfigured");
                 let _ = shared.fatal_error.set(e.to_string());
             }
         }
-        tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
-            _ = shared.stop.notified() => return false,
-        }
+        tokio::time::sleep(delay).await;
         delay = (delay * 2).min(MAX_RETRY_DELAY);
     }
 }
@@ -286,7 +291,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rows_survive_a_restart_while_writes_fail() {
+    async fn test_shutdown_drains_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = FakeWriter::default();
+        let sink = WalSink::new(writer.clone(), spawn_wal(dir.path()), config(100));
+
+        sink.put(records(&[1, 2])).await.unwrap();
+        sink.put(records(&[3])).await.unwrap();
+        sink.shutdown(Duration::from_secs(5)).await;
+
+        let written: Vec<i64> = writer.written.lock().unwrap().concat();
+        assert_eq!(written, vec![1, 2, 3]);
+        assert!(reopen(dir.path())
+            .await
+            .read_oldest(100)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_drain_retries_a_transient_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = FakeWriter {
+            failures: 1,
+            error: Some(|| clickhouse::error::Error::TimedOut),
+            ..FakeWriter::default()
+        };
+        let sink = WalSink::new(writer.clone(), spawn_wal(dir.path()), config(100));
+
+        sink.put(records(&[1])).await.unwrap();
+        sink.shutdown(Duration::from_secs(5)).await;
+
+        assert_eq!(*writer.written.lock().unwrap(), vec![vec![1]]);
+        assert!(reopen(dir.path())
+            .await
+            .read_oldest(100)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_drain_timeout_leaves_rows_in_the_wal() {
         let dir = tempfile::tempdir().unwrap();
         let writer = FakeWriter {
             failures: usize::MAX,
@@ -297,7 +342,7 @@ mod tests {
 
         sink.put(records(&[1, 2])).await.unwrap();
         eventually(|| writer.attempts.load(Ordering::SeqCst) > 0).await;
-        sink.shutdown(Duration::from_secs(1)).await;
+        sink.shutdown(Duration::from_millis(100)).await;
 
         let wal = reopen(dir.path()).await;
         assert_eq!(wal.read_oldest(100).unwrap().records, records(&[1, 2]));
