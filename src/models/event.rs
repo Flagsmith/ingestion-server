@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Reserved system event for flag-exposure tracking. `feature_name` is required
 /// for events of this type.
@@ -59,7 +59,7 @@ pub struct IngestResponse {
 /// destination `events` table stores them in String columns, and ClickPipes
 /// only maps flat scalar fields — a nested object field is left out of the
 /// pipe's field mapping and the column silently defaults to ''.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventRecord {
     pub environment_key: String,
     pub collected_at: i64,
@@ -67,20 +67,24 @@ pub struct EventRecord {
     pub sdk_version: String,
 
     pub event: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feature_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier: Option<String>,
-    #[serde(skip_serializing_if = "serde_json::Value::is_null")]
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub value: serde_json::Value,
     #[serde(
+        default,
         skip_serializing_if = "Option::is_none",
-        serialize_with = "json_string"
+        serialize_with = "json_string",
+        deserialize_with = "from_json_string"
     )]
     pub traits: Option<serde_json::Value>,
     #[serde(
+        default,
         skip_serializing_if = "Option::is_none",
-        serialize_with = "json_string"
+        serialize_with = "json_string",
+        deserialize_with = "from_json_string"
     )]
     pub metadata: Option<serde_json::Value>,
     pub timestamp: i64,
@@ -94,5 +98,17 @@ fn json_string<S: Serializer>(
     match value {
         Some(value) => serializer.collect_str(value),
         None => serializer.serialize_none(),
+    }
+}
+
+/// Reads back a JSON value that `json_string` wrote.
+fn from_json_string<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    match Option::<String>::deserialize(deserializer)? {
+        Some(text) => serde_json::from_str(&text)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        None => Ok(None),
     }
 }
