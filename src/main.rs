@@ -7,7 +7,7 @@ mod routes;
 mod sink;
 #[cfg(test)]
 mod test_helpers;
-#[allow(dead_code)] // used by the ClickHouse sink in a later commit
+#[allow(dead_code, unused_imports)] // used by the ClickHouse sink in a later commit
 mod wal;
 
 use std::sync::Arc;

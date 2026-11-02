@@ -5,6 +5,10 @@ use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinitio
 
 use crate::models::EventRecord;
 
+mod writer;
+
+pub use writer::WalHandle;
+
 /// One row per appended batch. Keys are microseconds since the epoch, bumped
 /// past the last key so they keep increasing even if the clock steps back.
 const BATCHES: TableDefinition<u64, &[u8]> = TableDefinition::new("batches");
@@ -121,13 +125,15 @@ pub enum WalError {
     Storage(#[from] redb::Error),
     #[error("WAL IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("WAL writer thread stopped")]
+    Stopped,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn records(timestamps: &[i64]) -> Vec<EventRecord> {
+    pub(super) fn records(timestamps: &[i64]) -> Vec<EventRecord> {
         timestamps
             .iter()
             .map(|&timestamp| EventRecord {
