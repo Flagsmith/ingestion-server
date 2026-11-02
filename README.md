@@ -20,7 +20,7 @@ Rust + axum, deployed as an ARM64 container on ECS Fargate.
 | `401` / `403` | Missing / unknown environment key. |
 | `415` | Missing `Content-Type: application/json`. |
 | `422` | Body is valid JSON but doesn't match the request schema (e.g. wrong field type) — plain-text body. |
-| `503` | Downstream delivery failed — retry the whole batch. Delivery is at-least-once: a partially delivered batch may produce duplicates on retry. |
+| `503` | Downstream delivery failed, or the WAL is full or unwritable — retry the whole batch. Delivery is at-least-once: a partially delivered batch may produce duplicates on retry. |
 
 `202` and validation `400` responses carry the same body shape:
 
@@ -66,6 +66,9 @@ On the wire to Kafka, `traits` and `metadata` are produced as JSON-encoded strin
 | `CLICKHOUSE_TABLE` | no | `events` |
 | `SINK_FLUSH_INTERVAL_MS` | no | `1000` |
 | `SINK_FLUSH_MAX_EVENTS` | no | `5000` |
+| `SINK_WAL_DIR` | no | unset (buffer in memory) |
+| `SINK_DRAIN_TIMEOUT_SECS` | no | `100` (with `SINK_WAL_DIR`) |
+| `SINK_WAL_MAX_BYTES` | no | unset (no cap) |
 | `DATABASE_URL` | yes | — |
 | `LISTEN_ADDR` | no | `0.0.0.0:8080` |
 
@@ -88,7 +91,24 @@ With `KAFKA_AUTH=scram`, the producer authenticates with SASL/SCRAM-SHA-512 over
 
 ### ClickHouse sink
 
-With `SINK=clickhouse`, `202` means the events are buffered in memory, not yet stored. A background task takes the whole buffer every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_FLUSH_MAX_EVENTS` events are waiting, and writes it as one `INSERT`. A batch that fails with a transient error (network, timeout, overload, or anything unrecognised) is retried 5 times over about 17 seconds, enough to ride out a ClickHouse restart, and then dropped with an error log; these never affect `/health`. Rows the table rejects (parse, type or constraint errors) drop the batch at once, with an error log, and leave `/health` alone. A config error (bad credentials or grants, or a missing database, table or column) drops the batch at once and fails `/health` until restart. At startup the server checks that ClickHouse is reachable, accepts the credentials, and has a table whose columns match, and exits with an error if not. The buffer is unbounded: requests never wait or get `503`, so while a write is slow or failing (up to about 3 minutes with retries) it grows by the ingest rate times the write time, and the next flush takes it all. A normal shutdown (SIGTERM) flushes the buffer, but events still buffered are lost if the process crashes.
+With `SINK=clickhouse` and no `SINK_WAL_DIR`, `202` means the events are buffered in memory, not yet stored. A background task takes the whole buffer every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_FLUSH_MAX_EVENTS` events are waiting, and writes it as one `INSERT`. A batch that fails with a transient error (network, timeout, overload, or anything unrecognised) is retried 5 times over about 17 seconds, enough to ride out a ClickHouse restart, and then dropped with an error log; these never affect `/health`. Rows the table rejects (parse, type or constraint errors) drop the batch at once, with an error log, and leave `/health` alone. A config error (bad credentials or grants, or a missing database, table or column) drops the batch at once and fails `/health` until restart. At startup the server checks that ClickHouse is reachable, accepts the credentials, and has a table whose columns match, and exits with an error if not. The buffer is unbounded: requests never wait or get `503`, so while a write is slow or failing (up to about 3 minutes with retries) it grows by the ingest rate times the write time, and the next flush takes it all. A normal shutdown (SIGTERM) flushes the buffer, but events still buffered are lost if the process crashes.
+
+### Write-ahead log
+
+With `SINK=clickhouse` and `SINK_WAL_DIR` set, the server buffers events in a write-ahead log (`wal.redb` in that directory) rather than in memory, so `202` means the events are on disk and survive a crash. Concurrent requests share one disk commit. A background task writes the oldest events to ClickHouse every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_FLUSH_MAX_EVENTS` are waiting, and deletes them from the WAL once the `INSERT` succeeds. Delivery is at-least-once: a crash between the two writes the events again on restart.
+
+- **Transient errors** are retried indefinitely, backing off from 1 s to 30 s; nothing is dropped.
+- **Rejected rows** (parse, type or constraint errors), and rows that no longer decode after an upgrade, move to the WAL's `rejected` table with an error log. A whole chunk is rejected even if only one row in it is bad. The `rejected` table is uncapped and never cleared.
+- **Config errors** fail `/health` until restart; the events stay in the WAL and are retried.
+- **Outages**: the WAL grows by the ingest rate for as long as ClickHouse is down. Once it holds `SINK_WAL_MAX_BYTES` of events, new requests get `503`. The cap counts event bytes, not the file size, and the file never shrinks, so set it well below the volume size (about 70%). Without a cap, a full disk also fails requests with `503`.
+- **Restart**: the server writes what the WAL holds before anything new.
+- **Shutdown** (SIGTERM): after in-flight requests finish, the server keeps writing until the WAL is empty or `SINK_DRAIN_TIMEOUT_SECS` passes; whatever is left stays in the WAL for the next start.
+
+Deployment requirements:
+
+- `SINK_WAL_DIR` must be on a persistent volume, one per instance: a second process cannot open the same WAL. ECS Fargate has no persistent disk, so the WAL is not supported there.
+- The orchestrator's grace period must exceed the drain timeout, e.g. Kubernetes `terminationGracePeriodSeconds` above `SINK_DRAIN_TIMEOUT_SECS`.
+- On Kubernetes, run a StatefulSet with `persistentVolumeClaimRetentionPolicy.whenScaled: Retain`. On scale-down the drain writes what it can; events left behind stay on the retained volume and are written when the instance with that ordinal comes back.
 
 ## Run locally
 
