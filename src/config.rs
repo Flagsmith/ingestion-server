@@ -29,6 +29,8 @@ pub struct WalConfig {
     /// How long shutdown keeps writing the WAL out before leaving the rest
     /// for the next start.
     pub drain_timeout: Duration,
+    /// Refuse new events (503) while the backlog holds this many bytes.
+    pub max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +122,11 @@ fn wal_config_from_env() -> Result<Option<WalConfig>, ConfigError> {
     Ok(Some(WalConfig {
         dir: PathBuf::from(dir),
         drain_timeout: Duration::from_secs(positive_env_var("SINK_DRAIN_TIMEOUT_SECS", 100)?),
+        max_bytes: match env::var_os("SINK_WAL_MAX_BYTES") {
+            None => None,
+            // The default is never used: the variable is set.
+            Some(_) => Some(positive_env_var("SINK_WAL_MAX_BYTES", 1)?),
+        },
     }))
 }
 

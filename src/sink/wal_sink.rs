@@ -383,4 +383,18 @@ mod tests {
         eventually(|| sink.fatal_error().is_some()).await;
         assert_eq!(wal_events(&wal).await, vec![1]);
     }
+
+    #[tokio::test]
+    async fn test_put_fails_when_the_wal_is_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal = WalHandle::spawn(Wal::open(dir.path()).unwrap().with_max_bytes(1));
+        let sink = WalSink::new(FakeWriter::default(), wal, config(1));
+
+        let result = sink.put(records(&[1])).await;
+
+        assert!(matches!(
+            result,
+            Err(SinkError::Wal(e)) if matches!(*e, crate::wal::WalError::Full { .. })
+        ));
+    }
 }

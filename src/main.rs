@@ -74,11 +74,14 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("ClickHouse startup check failed")?;
             let sink = match wal {
-                Some(wal) => {
-                    let dir = &wal.dir;
-                    shutdown_timeout = wal.drain_timeout;
-                    let wal = Wal::open(dir)
+                Some(wal_config) => {
+                    let dir = &wal_config.dir;
+                    shutdown_timeout = wal_config.drain_timeout;
+                    let mut wal = Wal::open(dir)
                         .with_context(|| format!("Could not open the WAL in {}", dir.display()))?;
+                    if let Some(max_bytes) = wal_config.max_bytes {
+                        wal = wal.with_max_bytes(max_bytes);
+                    }
                     Sink::ClickHouseWal(WalSink::new(writer, WalHandle::spawn(wal), batch.clone()))
                 }
                 None => Sink::ClickHouse(BatchingSink::new(writer, batch.clone())),
