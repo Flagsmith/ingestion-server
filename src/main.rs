@@ -20,7 +20,7 @@ use tracing::info;
 use auth::ContextState;
 use config::{Config, SinkConfig};
 use environment_keys::EnvironmentKeys;
-use sink::{BatchingSink, ClickHouseWriter, KafkaSink, KafkaSinkConfig, Sink, WalSink};
+use sink::{BatchingSink, KafkaSink, KafkaSinkConfig, Sink, WalSink, Warehouse};
 use wal::{Wal, WalHandle};
 
 const ENVIRONMENT_KEY_REFRESH_AFTER: Duration = Duration::from_secs(300);
@@ -56,23 +56,23 @@ async fn main() -> anyhow::Result<()> {
             ))?;
             (Sink::Kafka(sink), Some(kafka.external_topic.as_str()))
         }
-        SinkConfig::ClickHouse {
-            clickhouse,
+        SinkConfig::Warehouse {
+            warehouse,
             batch,
             wal,
         } => {
             info!(
                 listen_addr = %config.listen_addr,
-                clickhouse = ?clickhouse,
+                warehouse = ?warehouse,
                 batch = ?batch,
                 wal = ?wal,
                 "Starting flagsmith-analytics server"
             );
-            let writer = ClickHouseWriter::new(clickhouse.clone());
-            writer
+            let warehouse = Warehouse::new(warehouse.clone());
+            warehouse
                 .check()
                 .await
-                .context("ClickHouse startup check failed")?;
+                .context("Warehouse startup check failed")?;
             let sink = match wal {
                 Some(wal_config) => {
                     let dir = &wal_config.dir;
@@ -82,9 +82,13 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(max_bytes) = wal_config.max_bytes {
                         wal = wal.with_max_bytes(max_bytes);
                     }
-                    Sink::ClickHouseWal(WalSink::new(writer, WalHandle::spawn(wal), batch.clone()))
+                    Sink::Wal(WalSink::new(
+                        warehouse,
+                        WalHandle::spawn(wal),
+                        batch.clone(),
+                    ))
                 }
-                None => Sink::ClickHouse(BatchingSink::new(writer, batch.clone())),
+                None => Sink::Memory(BatchingSink::new(warehouse, batch.clone())),
             };
             (sink, None)
         }

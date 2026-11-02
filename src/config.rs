@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::sink::{BatchConfig, ClickHouseConfig, KafkaAuth};
+use crate::sink::{BatchConfig, ClickHouseConfig, KafkaAuth, WarehouseConfig};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -15,8 +15,9 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub enum SinkConfig {
     Kafka(KafkaConfig),
-    ClickHouse {
-        clickhouse: ClickHouseConfig,
+    /// Write directly to a warehouse.
+    Warehouse {
+        warehouse: WarehouseConfig,
         batch: BatchConfig,
         /// Buffer in a WAL rather than in memory.
         wal: Option<WalConfig>,
@@ -45,8 +46,8 @@ impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let sink = match parse_sink(env::var("SINK").ok().as_deref())? {
             SinkKind::Kafka => SinkConfig::Kafka(KafkaConfig::from_env()?),
-            SinkKind::ClickHouse => SinkConfig::ClickHouse {
-                clickhouse: clickhouse_config_from_env()?,
+            SinkKind::ClickHouse => SinkConfig::Warehouse {
+                warehouse: WarehouseConfig::ClickHouse(clickhouse_config_from_env()?),
                 batch: batch_config_from_env()?,
                 wal: wal_config_from_env()?,
             },

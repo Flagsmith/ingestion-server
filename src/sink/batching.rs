@@ -12,7 +12,7 @@ use super::{ErrorKind, SinkError};
 use crate::models::EventRecord;
 
 /// Waits between attempts to write a batch that failed with a transient error,
-/// before it is dropped: about 17 s in all, to ride out a ClickHouse restart.
+/// before it is dropped: about 17 s in all, to ride out a warehouse restart.
 const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(1),
     Duration::from_secs(2),

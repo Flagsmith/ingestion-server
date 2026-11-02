@@ -4,14 +4,16 @@ mod kafka;
 #[cfg(test)]
 mod test_support;
 mod wal_sink;
+mod warehouse;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 pub use batching::{BatchConfig, BatchingSink};
-pub use clickhouse::{ClickHouseConfig, ClickHouseWriter};
+pub use clickhouse::ClickHouseConfig;
 pub use kafka::{KafkaAuth, KafkaSink, KafkaSinkConfig};
 pub use wal_sink::WalSink;
+pub use warehouse::{Warehouse, WarehouseConfig};
 
 use crate::models::EventRecord;
 use crate::wal::WalError;
@@ -20,9 +22,10 @@ use crate::wal::WalError;
 #[derive(Clone)]
 pub enum Sink {
     Kafka(KafkaSink),
-    ClickHouse(BatchingSink<ClickHouseWriter>),
-    /// ClickHouse, buffered in the WAL when `SINK_WAL_DIR` is set.
-    ClickHouseWal(WalSink<ClickHouseWriter>),
+    /// A warehouse, buffered in memory.
+    Memory(BatchingSink<Warehouse>),
+    /// A warehouse, buffered in the WAL when `SINK_WAL_DIR` is set.
+    Wal(WalSink<Warehouse>),
 }
 
 impl Sink {
@@ -36,11 +39,11 @@ impl Sink {
         match self {
             Self::Kafka(sink) => Ok(sink.put(destination, &records).await?),
             // A single table: there is no per-environment destination.
-            Self::ClickHouse(sink) => {
+            Self::Memory(sink) => {
                 sink.put(records);
                 Ok(())
             }
-            Self::ClickHouseWal(sink) => sink.put(records).await,
+            Self::Wal(sink) => sink.put(records).await,
         }
     }
 
@@ -48,8 +51,8 @@ impl Sink {
     pub fn fatal_error(&self) -> Option<String> {
         match self {
             Self::Kafka(sink) => sink.fatal_error(),
-            Self::ClickHouse(sink) => sink.fatal_error(),
-            Self::ClickHouseWal(sink) => sink.fatal_error(),
+            Self::Memory(sink) => sink.fatal_error(),
+            Self::Wal(sink) => sink.fatal_error(),
         }
     }
 
@@ -57,8 +60,8 @@ impl Sink {
     pub async fn shutdown(self, timeout: Duration) {
         match self {
             Self::Kafka(sink) => sink.shutdown(timeout).await,
-            Self::ClickHouse(sink) => sink.shutdown(timeout).await,
-            Self::ClickHouseWal(sink) => sink.shutdown(timeout).await,
+            Self::Memory(sink) => sink.shutdown(timeout).await,
+            Self::Wal(sink) => sink.shutdown(timeout).await,
         }
     }
 }

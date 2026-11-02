@@ -95,12 +95,12 @@ With `SINK=clickhouse` and no `SINK_WAL_DIR`, `202` means the events are buffere
 
 ### Write-ahead log
 
-With `SINK=clickhouse` and `SINK_WAL_DIR` set, the server buffers events in a write-ahead log (`wal.redb` in that directory) rather than in memory, so `202` means the events are on disk and survive a crash. Concurrent requests share one disk commit. A background task writes the oldest events to ClickHouse every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_FLUSH_MAX_EVENTS` are waiting, and deletes them from the WAL once the `INSERT` succeeds. Delivery is at-least-once: a crash between the two writes the events again on restart.
+With a direct warehouse sink (today `SINK=clickhouse`) and `SINK_WAL_DIR` set, the server buffers events in a write-ahead log (`wal.redb` in that directory) rather than in memory, so `202` means the events are on disk and survive a crash. Concurrent requests share one disk commit. A background task writes the oldest events to the warehouse every `SINK_FLUSH_INTERVAL_MS`, or sooner once `SINK_FLUSH_MAX_EVENTS` are waiting, and deletes them from the WAL once the write succeeds. Delivery is at-least-once: a crash between the two writes the events again on restart.
 
 - **Transient errors** are retried indefinitely, backing off from 1 s to 30 s; nothing is dropped.
 - **Rejected rows** (parse, type or constraint errors), and rows that no longer decode after an upgrade, move to the WAL's `rejected` table with an error log. A whole chunk is rejected even if only one row in it is bad. The `rejected` table is uncapped and never cleared.
 - **Config errors** fail `/health` until restart; the events stay in the WAL and are retried.
-- **Outages**: the WAL grows by the ingest rate for as long as ClickHouse is down. Once it holds `SINK_WAL_MAX_BYTES` of events, new requests get `503`. The cap counts event bytes, not the file size, and the file never shrinks, so set it well below the volume size (about 70%). Without a cap, a full disk also fails requests with `503`.
+- **Outages**: the WAL grows by the ingest rate for as long as the warehouse is down. Once it holds `SINK_WAL_MAX_BYTES` of events, new requests get `503`. The cap counts event bytes, not the file size, and the file never shrinks, so set it well below the volume size (about 70%). Without a cap, a full disk also fails requests with `503`.
 - **Restart**: the server writes what the WAL holds before anything new.
 - **Shutdown** (SIGTERM): after in-flight requests finish, the server keeps writing until the WAL is empty or `SINK_WAL_DRAIN_TIMEOUT_SECS` passes; whatever is left stays in the WAL for the next start.
 
