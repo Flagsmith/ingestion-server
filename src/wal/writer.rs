@@ -11,6 +11,7 @@ pub trait Log: Send + 'static {
     fn append(&mut self, batches: &[Vec<EventRecord>]) -> Result<(), WalError>;
     fn read_oldest(&self, max_events: usize) -> Result<Chunk, WalError>;
     fn remove(&mut self, chunk: Chunk) -> Result<(), WalError>;
+    fn reject(&mut self, chunk: Chunk) -> Result<(), WalError>;
 }
 
 impl Log for Wal {
@@ -25,6 +26,10 @@ impl Log for Wal {
     fn remove(&mut self, chunk: Chunk) -> Result<(), WalError> {
         Wal::remove(self, chunk)
     }
+
+    fn reject(&mut self, chunk: Chunk) -> Result<(), WalError> {
+        Wal::reject(self, chunk)
+    }
 }
 
 /// Errors are shared, since one failed commit fails every append in it.
@@ -34,6 +39,7 @@ enum Request {
     Append(Vec<EventRecord>, Reply<()>),
     ReadOldest(usize, Reply<Chunk>),
     Remove(Chunk, Reply<()>),
+    Reject(Chunk, Reply<()>),
 }
 
 /// Sends requests to the thread that owns the log. The thread stops once
@@ -68,6 +74,10 @@ impl WalHandle {
         self.request(|reply| Request::Remove(chunk, reply)).await
     }
 
+    pub async fn reject(&self, chunk: Chunk) -> Result<(), Arc<WalError>> {
+        self.request(|reply| Request::Reject(chunk, reply)).await
+    }
+
     async fn request<T>(
         &self,
         request: impl FnOnce(Reply<T>) -> Request,
@@ -97,6 +107,9 @@ fn run(mut log: impl Log, mut requests: mpsc::UnboundedReceiver<Request>) {
                 }
                 Request::Remove(chunk, reply) => {
                     let _ = reply.send(log.remove(chunk).map_err(Arc::new));
+                }
+                Request::Reject(chunk, reply) => {
+                    let _ = reply.send(log.reject(chunk).map_err(Arc::new));
                 }
             }
         }
@@ -144,6 +157,10 @@ mod tests {
         }
 
         fn remove(&mut self, _chunk: Chunk) -> Result<(), WalError> {
+            unimplemented!()
+        }
+
+        fn reject(&mut self, _chunk: Chunk) -> Result<(), WalError> {
             unimplemented!()
         }
     }

@@ -1,4 +1,5 @@
 use std::env;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -17,6 +18,8 @@ pub enum SinkConfig {
     ClickHouse {
         clickhouse: ClickHouseConfig,
         batch: BatchConfig,
+        /// Buffer in a WAL in this directory rather than in memory.
+        wal_dir: Option<PathBuf>,
     },
 }
 
@@ -35,6 +38,7 @@ impl Config {
             SinkKind::ClickHouse => SinkConfig::ClickHouse {
                 clickhouse: clickhouse_config_from_env()?,
                 batch: batch_config_from_env()?,
+                wal_dir: env::var_os("SINK_WAL_DIR").map(PathBuf::from),
             },
         };
 

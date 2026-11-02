@@ -7,7 +7,6 @@ mod routes;
 mod sink;
 #[cfg(test)]
 mod test_helpers;
-#[allow(dead_code, unused_imports)] // used by the ClickHouse sink in a later commit
 mod wal;
 
 use std::sync::Arc;
@@ -21,7 +20,8 @@ use tracing::info;
 use auth::ContextState;
 use config::{Config, SinkConfig};
 use environment_keys::EnvironmentKeys;
-use sink::{BatchingSink, ClickHouseWriter, KafkaSink, KafkaSinkConfig, Sink};
+use sink::{BatchingSink, ClickHouseWriter, KafkaSink, KafkaSinkConfig, Sink, WalSink};
+use wal::{Wal, WalHandle};
 
 const ENVIRONMENT_KEY_REFRESH_AFTER: Duration = Duration::from_secs(300);
 
@@ -52,11 +52,16 @@ async fn main() -> anyhow::Result<()> {
             ))?;
             (Sink::Kafka(sink), Some(kafka.external_topic.as_str()))
         }
-        SinkConfig::ClickHouse { clickhouse, batch } => {
+        SinkConfig::ClickHouse {
+            clickhouse,
+            batch,
+            wal_dir,
+        } => {
             info!(
                 listen_addr = %config.listen_addr,
                 clickhouse = ?clickhouse,
                 batch = ?batch,
+                wal_dir = ?wal_dir,
                 "Starting flagsmith-analytics server"
             );
             let writer = ClickHouseWriter::new(clickhouse.clone());
@@ -64,10 +69,15 @@ async fn main() -> anyhow::Result<()> {
                 .check()
                 .await
                 .context("ClickHouse startup check failed")?;
-            (
-                Sink::ClickHouse(BatchingSink::new(writer, batch.clone())),
-                None,
-            )
+            let sink = match wal_dir {
+                Some(dir) => {
+                    let wal = Wal::open(dir)
+                        .with_context(|| format!("Could not open the WAL in {}", dir.display()))?;
+                    Sink::ClickHouseWal(WalSink::new(writer, WalHandle::spawn(wal), batch.clone()))
+                }
+                None => Sink::ClickHouse(BatchingSink::new(writer, batch.clone())),
+            };
+            (sink, None)
         }
     };
 

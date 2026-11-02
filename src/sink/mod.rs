@@ -1,20 +1,28 @@
 mod batching;
 mod clickhouse;
 mod kafka;
+#[cfg(test)]
+mod test_support;
+mod wal_sink;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use batching::{BatchConfig, BatchingSink};
 pub use clickhouse::{ClickHouseConfig, ClickHouseWriter};
 pub use kafka::{KafkaAuth, KafkaSink, KafkaSinkConfig};
+pub use wal_sink::WalSink;
 
 use crate::models::EventRecord;
+use crate::wal::WalError;
 
 /// Where accepted events are written.
 #[derive(Clone)]
 pub enum Sink {
     Kafka(KafkaSink),
     ClickHouse(BatchingSink<ClickHouseWriter>),
+    /// ClickHouse, buffered in the WAL when `SINK_WAL_DIR` is set.
+    ClickHouseWal(WalSink<ClickHouseWriter>),
 }
 
 impl Sink {
@@ -32,6 +40,7 @@ impl Sink {
                 sink.put(records);
                 Ok(())
             }
+            Self::ClickHouseWal(sink) => sink.put(records).await,
         }
     }
 
@@ -40,6 +49,7 @@ impl Sink {
         match self {
             Self::Kafka(sink) => sink.fatal_error(),
             Self::ClickHouse(sink) => sink.fatal_error(),
+            Self::ClickHouseWal(sink) => sink.fatal_error(),
         }
     }
 
@@ -48,6 +58,7 @@ impl Sink {
         match self {
             Self::Kafka(sink) => sink.shutdown(timeout).await,
             Self::ClickHouse(sink) => sink.shutdown(timeout).await,
+            Self::ClickHouseWal(sink) => sink.shutdown(timeout).await,
         }
     }
 }
@@ -58,6 +69,8 @@ pub enum SinkError {
     Kafka(#[from] kafka::DeliveryError),
     #[error("ClickHouse insert failed: {0}")]
     ClickHouse(#[from] ::clickhouse::error::Error),
+    #[error(transparent)]
+    Wal(#[from] Arc<WalError>),
 }
 
 /// What a failed write means for the batch and the server.
@@ -76,7 +89,7 @@ impl SinkError {
     /// Only batching sinks retry; the Kafka producer retries internally.
     pub fn kind(&self) -> ErrorKind {
         match self {
-            Self::Kafka(_) => ErrorKind::Transient,
+            Self::Kafka(_) | Self::Wal(_) => ErrorKind::Transient,
             Self::ClickHouse(e) => clickhouse::error_kind(e),
         }
     }
