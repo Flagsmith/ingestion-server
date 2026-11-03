@@ -145,12 +145,12 @@ async fn run<W: BatchWriter>(shared: Arc<Shared<W>>) {
 
 /// Writes the chunk and removes it from the WAL. Retries transient and
 /// config errors until the write succeeds, recording a config error to fail
-/// the health check; moves the chunk to the rejected table on bad data.
+/// the health check; drops the chunk on bad data.
 async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, chunk: Chunk) {
     if chunk.undecodable_rows > 0 {
         error!(
             rows = chunk.undecodable_rows,
-            "Sink rows undecodable, moved to the WAL's rejected table"
+            "Sink rows undecodable, dropped"
         );
     }
     let events = chunk.records.len();
@@ -175,9 +175,9 @@ async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, chunk: Chunk) {
                 warn!(events, error = %e, "Sink chunk write failed, retrying");
             }
             ErrorKind::BadData => {
-                error!(events, error = %e, "Sink rows rejected, moved to the WAL's rejected table");
-                if let Err(e) = shared.wal.reject(chunk).await {
-                    error!(events, error = %e, "Sink rows not moved to the rejected table");
+                error!(events, error = %e, "Sink chunk dropped: rows rejected");
+                if let Err(e) = shared.wal.remove(chunk).await {
+                    error!(events, error = %e, "Sink rejected rows left in the WAL; they will be written again");
                 }
                 return;
             }
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_moves_bad_data_out_of_the_wal_and_stays_healthy() {
+    async fn test_drops_bad_data_from_the_wal_and_stays_healthy() {
         let dir = tempfile::tempdir().unwrap();
         let wal = spawn_wal(dir.path());
         let writer = FakeWriter {

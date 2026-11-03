@@ -13,9 +13,6 @@ pub use handle::WalHandle;
 /// past the last key so they keep increasing even if the clock steps back.
 const BATCHES: TableDefinition<u64, &[u8]> = TableDefinition::new("batches");
 
-/// Rows the store rejected or that no longer decode, kept for inspection.
-const REJECTED: TableDefinition<u64, &[u8]> = TableDefinition::new("rejected");
-
 /// Durable log of accepted batches, stored in `wal.redb` under a directory.
 pub struct Wal {
     db: Database,
@@ -27,20 +24,19 @@ pub struct Wal {
 }
 
 /// The oldest rows, read for one write. Pass it back to `remove` once
-/// written, or to `reject` if the store rejects it.
+/// written or dropped.
 #[derive(Debug)]
 pub struct Chunk {
     pub records: Vec<EventRecord>,
     /// Rows that no longer decode as `EventRecord`s, e.g. after a schema
-    /// change. Either way they move to the rejected table.
+    /// change. `remove` deletes them too.
     pub undecodable_rows: usize,
     keys: Vec<u64>,
-    undecodable_keys: Vec<u64>,
 }
 
 impl Chunk {
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty() && self.undecodable_keys.is_empty()
+        self.keys.is_empty()
     }
 }
 
@@ -120,7 +116,6 @@ impl Wal {
             records: Vec::new(),
             undecodable_rows: 0,
             keys: Vec::new(),
-            undecodable_keys: Vec::new(),
         };
         for row in table.iter().map_err(redb::Error::from)? {
             let (key, value) = row.map_err(redb::Error::from)?;
@@ -131,49 +126,25 @@ impl Wal {
                         break;
                     }
                     chunk.records.extend(records);
-                    chunk.keys.push(key.value());
                 }
-                Err(_) => {
-                    chunk.undecodable_rows += 1;
-                    chunk.undecodable_keys.push(key.value());
-                }
+                Err(_) => chunk.undecodable_rows += 1,
             }
+            chunk.keys.push(key.value());
         }
         Ok(chunk)
     }
 
-    /// Deletes a written chunk's rows, and moves its undecodable rows to the
-    /// rejected table, in one durable commit.
+    /// Deletes a chunk's rows in one durable commit.
     pub fn remove(&mut self, chunk: Chunk) -> Result<(), WalError> {
-        self.remove_rows(&chunk.keys, &chunk.undecodable_keys)
-    }
-
-    /// Moves all of a chunk's rows to the rejected table in one durable commit.
-    pub fn reject(&mut self, chunk: Chunk) -> Result<(), WalError> {
-        self.remove_rows(&[], &[chunk.keys, chunk.undecodable_keys].concat())
-    }
-
-    /// Deletes the `delete` rows and moves the `reject` rows to the rejected
-    /// table.
-    fn remove_rows(&mut self, delete: &[u64], reject: &[u64]) -> Result<(), WalError> {
         let mut txn = self.db.begin_write().map_err(redb::Error::from)?;
         txn.set_durability(Durability::Immediate)
             .map_err(redb::Error::from)?;
         let mut freed_bytes = 0;
         {
             let mut batches = txn.open_table(BATCHES).map_err(redb::Error::from)?;
-            let mut rejected = txn.open_table(REJECTED).map_err(redb::Error::from)?;
-            for &key in delete {
+            for key in chunk.keys {
                 if let Some(row) = batches.remove(key).map_err(redb::Error::from)? {
                     freed_bytes += row.value().len() as u64;
-                }
-            }
-            for &key in reject {
-                if let Some(row) = batches.remove(key).map_err(redb::Error::from)? {
-                    freed_bytes += row.value().len() as u64;
-                    rejected
-                        .insert(key, row.value())
-                        .map_err(redb::Error::from)?;
                 }
             }
         }
@@ -230,18 +201,6 @@ mod tests {
         txn.open_table(BATCHES).unwrap().insert(key, row).unwrap();
         txn.commit().unwrap();
         wal.held_bytes += row.len() as u64;
-    }
-
-    fn rejected_rows(wal: &Wal) -> Vec<Vec<u8>> {
-        let txn = wal.db.begin_read().unwrap();
-        let Ok(table) = txn.open_table(REJECTED) else {
-            return Vec::new();
-        };
-        table
-            .iter()
-            .unwrap()
-            .map(|row| row.unwrap().1.value().to_vec())
-            .collect()
     }
 
     #[test]
@@ -305,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn test_skips_undecodable_rows_and_remove_rejects_them() {
+    fn test_skips_undecodable_rows_and_remove_deletes_them() {
         let dir = tempfile::tempdir().unwrap();
         let mut wal = Wal::open(dir.path()).unwrap();
         wal.append(&[records(&[1])]).unwrap();
@@ -320,20 +279,7 @@ mod tests {
 
         wal.remove(chunk).unwrap();
         assert!(wal.read_oldest(100).unwrap().is_empty());
-        assert_eq!(rejected_rows(&wal), vec![b"not json".to_vec()]);
-    }
-
-    #[test]
-    fn test_reject_moves_the_chunk_to_the_rejected_table() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut wal = Wal::open(dir.path()).unwrap();
-        wal.append(&[records(&[1]), records(&[2])]).unwrap();
-        let chunk = wal.read_oldest(1).unwrap();
-        wal.reject(chunk).unwrap();
-
-        assert_eq!(wal.read_oldest(100).unwrap().records, records(&[2]));
-        let rejected = serde_json::to_vec(&records(&[1])).unwrap();
-        assert_eq!(rejected_rows(&wal), vec![rejected]);
+        assert_eq!(wal.held_bytes, 0);
     }
 
     #[test]
@@ -392,10 +338,8 @@ mod tests {
         ));
         assert_eq!(wal.read_oldest(100).unwrap().records, records(&[1, 2]));
 
-        let chunk = wal.read_oldest(1).unwrap();
+        let chunk = wal.read_oldest(100).unwrap();
         wal.remove(chunk).unwrap();
-        let chunk = wal.read_oldest(1).unwrap();
-        wal.reject(chunk).unwrap();
         wal.append(&[records(&[3]), records(&[4])]).unwrap();
     }
 
