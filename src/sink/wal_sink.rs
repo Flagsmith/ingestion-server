@@ -10,7 +10,7 @@ use tracing::{error, warn};
 use super::batching::{BatchConfig, BatchWriter};
 use super::{ErrorKind, SinkError};
 use crate::models::EventRecord;
-use crate::wal::{Chunk, WalHandle};
+use crate::wal::{Chunk, WalError, WalHandle};
 
 /// Waits between attempts to write a chunk that failed with a transient or
 /// config error: doubling from the first, up to the max, until it succeeds.
@@ -25,8 +25,17 @@ struct Shared<W: BatchWriter> {
     events_since_read: AtomicUsize,
     flush_now: Notify,
     stop: Notify,
-    /// The first config error; stays set until restart.
+    /// The first config or WAL error; stays set until restart.
     fatal_error: OnceLock<String>,
+}
+
+impl<W: BatchWriter> Shared<W> {
+    /// Fails the health check unless the WAL is only full.
+    fn wal_failed(&self, e: &WalError) {
+        if !matches!(e, WalError::Full { .. }) {
+            let _ = self.fatal_error.set(e.to_string());
+        }
+    }
 }
 
 /// Like `BatchingSink`, but buffers in the WAL rather than in memory, so a
@@ -67,7 +76,10 @@ impl<W: BatchWriter> WalSink<W> {
     /// Returns once the records are durable in the WAL.
     pub async fn put(&self, records: Vec<EventRecord>) -> Result<(), SinkError> {
         let events = records.len();
-        self.shared.wal.append(records).await?;
+        if let Err(e) = self.shared.wal.append(records).await {
+            self.shared.wal_failed(&e);
+            return Err(e.into());
+        }
         let events_since_read = self
             .shared
             .events_since_read
@@ -79,8 +91,8 @@ impl<W: BatchWriter> WalSink<W> {
         Ok(())
     }
 
-    /// A config error, such as bad credentials or a missing table, that
-    /// stops every write until the server is fixed.
+    /// A config error, such as bad credentials or a missing table, or a
+    /// broken WAL, that stops every write until the server is fixed.
     pub fn fatal_error(&self) -> Option<String> {
         self.shared.fatal_error.get().cloned()
     }
@@ -125,6 +137,7 @@ async fn run<W: BatchWriter>(shared: Arc<Shared<W>>) {
             Ok(chunk) => chunk,
             Err(e) => {
                 error!(error = %e, "Sink could not read the WAL");
+                shared.wal_failed(&e);
                 if draining {
                     return;
                 }
@@ -165,6 +178,7 @@ async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, chunk: Chunk) {
             Ok(()) => {
                 if let Err(e) = shared.wal.remove(chunk).await {
                     error!(events, error = %e, "Sink rows written but left in the WAL; they will be written again");
+                    shared.wal_failed(&e);
                 }
                 return;
             }
@@ -178,6 +192,7 @@ async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, chunk: Chunk) {
                 error!(events, error = %e, "Sink chunk dropped: rows rejected");
                 if let Err(e) = shared.wal.remove(chunk).await {
                     error!(events, error = %e, "Sink rejected rows left in the WAL; they will be written again");
+                    shared.wal_failed(&e);
                 }
                 return;
             }
@@ -398,7 +413,23 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(SinkError::Wal(e)) if matches!(*e, crate::wal::WalError::Full { .. })
+            Err(SinkError::Wal(e)) if matches!(*e, WalError::Full { .. })
         ));
+        assert_eq!(sink.fatal_error(), None);
+    }
+
+    #[tokio::test]
+    async fn test_put_fails_health_when_the_wal_is_broken() {
+        let sink = WalSink::new(FakeWriter::default(), WalHandle::stopped(), config(1));
+
+        assert!(sink.put(records(&[1])).await.is_err());
+        assert!(sink.fatal_error().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_flusher_fails_health_when_the_wal_is_broken() {
+        let sink = WalSink::new(FakeWriter::default(), WalHandle::stopped(), config(1));
+
+        wait_for(|| sink.fatal_error().is_some()).await;
     }
 }

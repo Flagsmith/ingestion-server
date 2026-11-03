@@ -54,6 +54,13 @@ impl WalHandle {
         WalHandle { requests }
     }
 
+    /// A handle whose thread has stopped: every request fails.
+    #[cfg(test)]
+    pub fn stopped() -> Self {
+        let (requests, _) = mpsc::unbounded_channel();
+        WalHandle { requests }
+    }
+
     /// Returns once the records are durable.
     pub async fn append(&self, records: Vec<EventRecord>) -> Result<(), Arc<WalError>> {
         self.request(|reply| Request::Append(records, reply)).await

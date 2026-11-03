@@ -8,7 +8,7 @@ Rust + axum, deployed as an ARM64 container on ECS Fargate.
 
 | Method | Path | Description |
 |---|---|---|
-| GET | `/health` | Liveness probe → `{"status":"healthy"}`. Touches no downstream; returns `503` once the sink has hit a fatal error (the Kafka producer's, or a ClickHouse config error), so ECS replaces the task. |
+| GET | `/health` | Liveness probe → `{"status":"healthy"}`. Touches no downstream; returns `503` once the sink has hit a fatal error (the Kafka producer's, a ClickHouse config error, or a broken WAL), so ECS replaces the task. |
 | POST | `/v1/events` | Ingest an event batch. Requires the `X-Environment-Key` header. |
 
 `POST /v1/events` validates each event independently — invalid events are rejected individually and never block valid ones in the same batch.
@@ -100,6 +100,7 @@ With a direct warehouse sink (today `SINK=clickhouse`) and `SINK_WAL_DIR` set, t
 - **Transient errors** are retried indefinitely, backing off from 1 s to 30 s; nothing is dropped.
 - **Rejected rows** (parse, type or constraint errors), and rows that no longer decode after an upgrade, are dropped with an error log. A whole chunk is dropped even if only one row in it is bad.
 - **Config errors** fail `/health` until restart; the events stay in the WAL and are retried.
+- **WAL errors** (storage or IO, but not a full WAL) fail `/health` until restart.
 - **Outages**: the WAL grows by the ingest rate for as long as the warehouse is down. Once it holds `SINK_WAL_MAX_BYTES` of events, new requests get `503`. The cap counts event bytes, not the file size, and the file never shrinks, so set it well below the volume size (about 70%). Without a cap, a full disk also fails requests with `503`.
 - **Restart**: the server writes what the WAL holds before anything new.
 - **Shutdown** (SIGTERM): after in-flight requests finish, the server keeps writing until the WAL is empty or `SINK_WAL_DRAIN_TIMEOUT_SECS` passes; whatever is left stays in the WAL for the next start.
