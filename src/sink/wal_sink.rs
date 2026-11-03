@@ -188,6 +188,7 @@ async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, chunk: Chunk) {
             ErrorKind::Transient => {
                 warn!(events, error = %e, "Sink chunk write failed, retrying");
             }
+            // TODO: one bad row drops the whole chunk; split it to find the bad rows if this happens often.
             ErrorKind::BadData => {
                 error!(events, error = %e, "Sink chunk dropped: rows rejected");
                 if let Err(e) = shared.wal.remove(chunk).await {
