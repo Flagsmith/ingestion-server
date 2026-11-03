@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use tokio::sync::{mpsc, oneshot};
+use tracing::error;
 
 use super::{Chunk, Wal, WalError};
 use crate::models::EventRecord;
@@ -34,31 +35,55 @@ enum Request {
     Append(Vec<EventRecord>, Reply<()>),
     ReadOldest(usize, Reply<Chunk>),
     Remove(Chunk, Reply<()>),
+    Close,
 }
 
-/// Sends requests to the thread that owns the log. The thread stops once
-/// every handle is dropped.
+/// Sends requests to the thread that owns the log. The thread stops on
+/// `close`, or once every handle is dropped.
 #[derive(Clone)]
 pub struct WalHandle {
     requests: mpsc::UnboundedSender<Request>,
+    thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 impl WalHandle {
     /// Runs the log on its own thread, since every call blocks on disk.
     pub fn spawn(log: impl Log) -> Self {
         let (requests, receiver) = mpsc::unbounded_channel();
-        thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("wal".to_string())
             .spawn(move || run(log, receiver))
             .expect("spawn the WAL thread");
-        WalHandle { requests }
+        WalHandle {
+            requests,
+            thread: Arc::new(Mutex::new(Some(thread))),
+        }
     }
 
     /// A handle whose thread has stopped: every request fails.
     #[cfg(test)]
     pub fn stopped() -> Self {
         let (requests, _) = mpsc::unbounded_channel();
-        WalHandle { requests }
+        WalHandle {
+            requests,
+            thread: Arc::default(),
+        }
+    }
+
+    /// Stops the thread after the requests already queued, and waits for it
+    /// to close the log, so the next open skips repair. Later requests fail
+    /// with `Stopped`, even through other handles.
+    pub async fn close(&self) {
+        let _ = self.requests.send(Request::Close);
+        let Some(thread) = self.thread.lock().expect("thread lock").take() else {
+            return;
+        };
+        if !matches!(
+            tokio::task::spawn_blocking(|| thread.join()).await,
+            Ok(Ok(()))
+        ) {
+            error!("WAL thread panicked");
+        }
     }
 
     /// Returns once the records are durable.
@@ -87,14 +112,19 @@ impl WalHandle {
 }
 
 /// Takes every queued request at once. Reads and removes run as they come;
-/// the appends then share one commit.
+/// the appends then share one commit. Returns, dropping the log, on `Close`.
 fn run(mut log: impl Log, mut requests: mpsc::UnboundedReceiver<Request>) {
+    let mut closing = false;
     while let Some(first) = requests.blocking_recv() {
         let mut batches = Vec::new();
         let mut replies = Vec::new();
         let queued = std::iter::from_fn(|| requests.try_recv().ok());
         for request in std::iter::once(first).chain(queued) {
             match request {
+                Request::Close => {
+                    closing = true;
+                    break;
+                }
                 Request::Append(records, reply) => {
                     batches.push(records);
                     replies.push(reply);
@@ -107,12 +137,14 @@ fn run(mut log: impl Log, mut requests: mpsc::UnboundedReceiver<Request>) {
                 }
             }
         }
-        if batches.is_empty() {
-            continue;
+        if !batches.is_empty() {
+            let result = log.append(&batches).map_err(Arc::new);
+            for reply in replies {
+                let _ = reply.send(result.clone());
+            }
         }
-        let result = log.append(&batches).map_err(Arc::new);
-        for reply in replies {
-            let _ = reply.send(result.clone());
+        if closing {
+            return;
         }
     }
 }
@@ -198,5 +230,22 @@ mod tests {
         assert_eq!(chunk.records, records(&[1, 2]));
         handle.remove(chunk).await.unwrap();
         assert!(handle.read_oldest(100).await.unwrap().records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_close_closes_the_log_while_other_handles_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = WalHandle::spawn(Wal::open(dir.path()).unwrap());
+        let other = handle.clone();
+        let append = handle.append(records(&[1]));
+        let (appended, ()) = tokio::join!(append, handle.close());
+
+        appended.unwrap();
+        assert!(matches!(
+            *other.append(records(&[2])).await.unwrap_err(),
+            WalError::Stopped
+        ));
+        let wal = Wal::open(dir.path()).unwrap();
+        assert_eq!(wal.read_oldest(100).unwrap().records, records(&[1]));
     }
 }

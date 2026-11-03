@@ -99,19 +99,23 @@ impl<W: BatchWriter> WalSink<W> {
 
     /// Write the WAL out until it is empty, retrying transient errors, bounded
     /// by `timeout`. Rows not yet written stay in the WAL for the next start.
+    /// Then closes the WAL.
     pub async fn shutdown(self, timeout: Duration) {
         self.shared.stop.notify_one();
-        let Some(mut flusher) = self.flusher.lock().expect("flusher lock").take() else {
-            return;
-        };
-        match tokio::time::timeout(timeout, &mut flusher).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => warn!(error = %e, "Sink flush task failed"),
-            Err(_) => {
-                flusher.abort();
-                warn!("Sink drain timed out; unwritten rows stay in the WAL for the next start");
+        let flusher = self.flusher.lock().expect("flusher lock").take();
+        if let Some(mut flusher) = flusher {
+            match tokio::time::timeout(timeout, &mut flusher).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!(error = %e, "Sink flush task failed"),
+                Err(_) => {
+                    flusher.abort();
+                    warn!(
+                        "Sink drain timed out; unwritten rows stay in the WAL for the next start"
+                    );
+                }
             }
         }
+        self.shared.wal.close().await;
     }
 }
 
@@ -235,19 +239,6 @@ mod tests {
         }
     }
 
-    /// The WAL thread closes the file a moment after its last handle
-    /// is dropped.
-    async fn reopen(dir: &Path) -> Wal {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match Wal::open(dir) {
-                Ok(wal) => return wal,
-                Err(e) => assert!(Instant::now() < deadline, "{e}"),
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
-
     async fn wal_timestamps(wal: &WalHandle) -> Vec<i64> {
         let chunk = wal.read_oldest(usize::MAX).await.unwrap();
         chunk
@@ -322,11 +313,9 @@ mod tests {
 
         let written: Vec<i64> = writer.written.lock().unwrap().concat();
         assert_eq!(written, vec![1, 2, 3]);
-        assert!(reopen(dir.path())
-            .await
-            .read_oldest(100)
-            .unwrap()
-            .is_empty());
+        // Shutdown closed the WAL, so it reopens at once.
+        let wal = Wal::open(dir.path()).unwrap();
+        assert!(wal.read_oldest(100).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -343,11 +332,8 @@ mod tests {
         sink.shutdown(Duration::from_secs(5)).await;
 
         assert_eq!(*writer.written.lock().unwrap(), vec![vec![1]]);
-        assert!(reopen(dir.path())
-            .await
-            .read_oldest(100)
-            .unwrap()
-            .is_empty());
+        let wal = Wal::open(dir.path()).unwrap();
+        assert!(wal.read_oldest(100).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -364,7 +350,7 @@ mod tests {
         wait_for(|| writer.attempts.load(Ordering::SeqCst) > 0).await;
         sink.shutdown(Duration::from_millis(100)).await;
 
-        let wal = reopen(dir.path()).await;
+        let wal = Wal::open(dir.path()).unwrap();
         assert_eq!(wal.read_oldest(100).unwrap().records, records(&[1, 2]));
     }
 
