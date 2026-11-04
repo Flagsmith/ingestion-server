@@ -12,7 +12,7 @@ use super::{ErrorKind, SinkError};
 use crate::models::EventRecord;
 
 /// Waits between attempts to write a batch that failed with a transient error,
-/// before it is dropped: about 17 s in all, to ride out a ClickHouse restart.
+/// before it is dropped: about 17 s in all, to ride out a warehouse restart.
 const RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -161,53 +161,10 @@ async fn write_with_retries<W: BatchWriter>(shared: &Shared<W>, records: &[Event
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
 
     use super::*;
-
-    /// Records every write attempt; each takes `delay`, and the first
-    /// `failures` fail with `error`.
-    #[derive(Clone, Default)]
-    struct FakeWriter {
-        failures: usize,
-        error: Option<fn() -> clickhouse::error::Error>,
-        delay: Duration,
-        attempts: Arc<AtomicUsize>,
-        written: Arc<Mutex<Vec<Vec<i64>>>>,
-    }
-
-    impl BatchWriter for FakeWriter {
-        async fn write(&self, records: &[EventRecord]) -> Result<(), SinkError> {
-            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
-            tokio::time::sleep(self.delay).await;
-            if attempt < self.failures {
-                let error = self.error.expect("an error to fail with");
-                return Err(error().into());
-            }
-            let timestamps = records.iter().map(|record| record.timestamp).collect();
-            self.written.lock().unwrap().push(timestamps);
-            Ok(())
-        }
-    }
-
-    fn records(timestamps: &[i64]) -> Vec<EventRecord> {
-        timestamps
-            .iter()
-            .map(|&timestamp| EventRecord {
-                environment_key: "env".to_string(),
-                collected_at: timestamp,
-                sdk_language: "rust".to_string(),
-                sdk_version: "1.0.0".to_string(),
-                event: "purchase".to_string(),
-                feature_name: None,
-                identifier: None,
-                value: serde_json::Value::Null,
-                traits: None,
-                metadata: None,
-                timestamp,
-            })
-            .collect()
-    }
+    use crate::sink::test_support::{records, FakeWriter};
 
     fn config(flush_interval: Duration, flush_max_events: usize) -> BatchConfig {
         BatchConfig {

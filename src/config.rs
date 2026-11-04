@@ -1,8 +1,9 @@
 use std::env;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
-use crate::sink::{BatchConfig, ClickHouseConfig, KafkaAuth};
+use crate::sink::{BatchConfig, ClickHouseConfig, KafkaAuth, WarehouseConfig};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -14,10 +15,23 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub enum SinkConfig {
     Kafka(KafkaConfig),
-    ClickHouse {
-        clickhouse: ClickHouseConfig,
+    /// Write directly to a warehouse.
+    Warehouse {
+        warehouse: WarehouseConfig,
         batch: BatchConfig,
+        /// Buffer in a WAL rather than in memory.
+        wal: Option<WalConfig>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct WalConfig {
+    pub dir: PathBuf,
+    /// How long shutdown keeps writing the WAL out before leaving the rest
+    /// for the next start.
+    pub drain_timeout: Duration,
+    /// Refuse new events (503) while the backlog holds this many bytes.
+    pub max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,9 +46,10 @@ impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
         let sink = match parse_sink(env::var("SINK").ok().as_deref())? {
             SinkKind::Kafka => SinkConfig::Kafka(KafkaConfig::from_env()?),
-            SinkKind::ClickHouse => SinkConfig::ClickHouse {
-                clickhouse: clickhouse_config_from_env()?,
+            SinkKind::ClickHouse => SinkConfig::Warehouse {
+                warehouse: WarehouseConfig::ClickHouse(clickhouse_config_from_env()?),
                 batch: batch_config_from_env()?,
+                wal: wal_config_from_env()?,
             },
         };
 
@@ -98,6 +113,22 @@ fn batch_config_from_env() -> Result<BatchConfig, ConfigError> {
         flush_interval: Duration::from_millis(positive_env_var("SINK_FLUSH_INTERVAL_MS", 1000)?),
         flush_max_events: positive_env_var("SINK_FLUSH_MAX_EVENTS", 5000)?,
     })
+}
+
+/// Set only when `SINK_WAL_DIR` is.
+fn wal_config_from_env() -> Result<Option<WalConfig>, ConfigError> {
+    let Some(dir) = env::var_os("SINK_WAL_DIR") else {
+        return Ok(None);
+    };
+    Ok(Some(WalConfig {
+        dir: PathBuf::from(dir),
+        drain_timeout: Duration::from_secs(positive_env_var("SINK_WAL_DRAIN_TIMEOUT_SECS", 100)?),
+        max_bytes: match env::var_os("SINK_WAL_MAX_BYTES") {
+            None => None,
+            // The default is never used: the variable is set.
+            Some(_) => Some(positive_env_var("SINK_WAL_MAX_BYTES", 1)?),
+        },
+    }))
 }
 
 fn positive_env_var<T: FromStr + Default + PartialOrd>(
